@@ -1,0 +1,15 @@
+[submodule "rpico-pwm"]
+	path = rpico-pwm
+	url = git@github.com:hirobon1690/rpico-pwm.git
+[submodule "lib/rpico-motor"]
+	path = lib/rpico-motor
+	url = git@github.com:hirobon1690/rpico-motor.git
+[submodule "lib/rpico-encoder-plus"]
+	path = lib/rpico-encoder-plus
+	url = git@github.com:hirobon1690/rpico-encoder-plus.git
+[submodule "lib/rpico-encoder-base"]
+	path = lib/rpico-encoder-base
+	url = git@github.com:hirobon1690/rpico-encoder-base.git
+[submodule "lib/generic-pid"]
+	path = lib/generic-pid
+	url = git@github.com:hirobon1690/generic-pid.git
