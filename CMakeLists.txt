@@ -39,7 +39,13 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(rpico-motor-driver rpico-motor-driver.cpp )
+add_executable(rpico-motor-driver
+          rpico-motor-driver.cpp
+          ./lib/rpico-pwm/pwm.cpp
+          ./lib/rpico-encoder-plus/qenc.cpp
+          ./lib/rpico-motor/motor.cpp
+          ./lib/generic-pid/pid.cpp
+          )
 
 pico_set_program_name(rpico-motor-driver "rpico-motor-driver")
 pico_set_program_version(rpico-motor-driver "0.1")
@@ -53,7 +59,9 @@ pico_enable_stdio_usb(rpico-motor-driver 1)
 
 # Add the standard library to the build
 target_link_libraries(rpico-motor-driver
-        pico_stdlib)
+        pico_stdlib
+        hardware_pwm
+        )
 
 # Add the standard include files to the build
 target_include_directories(rpico-motor-driver PRIVATE
