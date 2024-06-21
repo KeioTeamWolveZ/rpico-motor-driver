@@ -45,6 +45,7 @@ add_executable(rpico-motor-driver
           ./lib/rpico-encoder-plus/qenc.cpp
           ./lib/rpico-motor/motor.cpp
           ./lib/generic-pid/pid.cpp
+          ./lib/rpico-servo/servo.cpp
           )
 
 pico_set_program_name(rpico-motor-driver "rpico-motor-driver")

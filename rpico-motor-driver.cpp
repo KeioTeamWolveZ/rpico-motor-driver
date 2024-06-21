@@ -1,18 +1,19 @@
 #include <stdio.h>
 #include <cstdlib>
+#include "../lib/rpico-encoder-plus/qenc.h"
+#include "../lib/rpico-motor/motor.h"
 #include "../lib/rpico-pwm/pwm.h"
+#include "../lib/rpico-servo/servo.h"
 #include "hardware/pio.h"
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
-#include "../lib/rpico-motor/motor.h"
-#include "../lib/rpico-encoder-plus/qenc.h"
 // #include "encoder.pio.h"
 
-
-Pwm pwm[4] = {Pwm(6, 10000), Pwm(7, 10000), Pwm(2, 10000), Pwm(3, 10000)};
+Pwm pwm[4] = {Pwm(6, 50000), Pwm(7, 50000), Pwm(2, 50000), Pwm(3, 50000)};
+Servo servo(0);
 Qenc enc[2] = {Qenc(26), Qenc(28)};
 
-Motor motor[2] = {Motor(pwm[0], pwm[3], enc[0]) , Motor(pwm[2], pwm[1], enc[1])};
+Motor motor[2] = {Motor(pwm[3], pwm[0], enc[0]), Motor(pwm[1], pwm[2], enc[1])};
 
 char buf[255];
 
@@ -47,23 +48,49 @@ void initTimer() {
     add_repeating_timer_ms(-100, timer_cb_pos, NULL, &timer1);
 }
 
-
 void setup() {
     stdio_init_all();
+    gpio_set_dir(26, GPIO_IN);
+    gpio_set_dir(27, GPIO_IN);
+    gpio_set_dir(28, GPIO_IN);
+    gpio_set_dir(29, GPIO_IN);
     motor[0].init();
     motor[1].init();
-    // stdio_set_chars_available_callback(uart_cb, nullptr);
+    servo.init();
+    initTimer();
 }
 
 int main() {
     setup();
     while (true) {
         readline(buf);
-        double duty[2]={0,0};
-        sscanf(buf, "%lf %lf", &duty[0], &duty[1]);
-        motor[0].duty(duty[0]);
-        // motor[1].duty(-0.5);
-        motor[1].duty(duty[1]);
-        printf("motor[0]: %f, motor[1]: %f", duty[0], duty[1]);
+        int id;
+        int mode;
+        double val;
+        sscanf(buf, "%d %d %lf", &id, &mode, &val);
+        printf("id: %d mode: %d val: %f\n", id, mode, val);
+        switch (id) {
+            case 0:
+                if (!mode) {
+                    motor[0].disablePosPid();
+                    motor[0].setVel(val);
+                } else {
+                    motor[0].resetPos();
+                    motor[0].setPos(val);
+                }
+                break;
+            case 1:
+                if (!mode) {
+                    motor[1].disablePosPid();
+                    motor[1].setVel(val);
+                } else {
+                    motor[1].resetPos();
+                    motor[1].setPos(val);
+                }
+                break;
+            case 2:
+                servo.write((int)val);
+                break;
+        }
     }
 }
