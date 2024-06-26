@@ -18,5 +18,5 @@ git clone git@github.com:KeioTeamWolveZ/rpico-motor-driver.git --recurse-submodu
 右下の `Build UF2` をクリックする．
 
 ### 4. Upload
-XIAOをBOOTボタン(B)を押しながらパソコンに接続．
+XIAOをBOOTボタン(B)を押しながらパソコンに接続．  
 `./build/rpico-motor-driver.uf2` をマイコンのフォルダにドラッグアンドドロップして書き込む．
