@@ -1,4 +1,4 @@
-# wolvez2024 rpico-motor-driver
+# wolvez2024 rpico-motor-controller
 ## About
 XIAO RP2040を用いてモータの速度・位置制御を行います．
 
