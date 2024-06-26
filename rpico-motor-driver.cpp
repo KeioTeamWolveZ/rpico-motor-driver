@@ -56,6 +56,12 @@ void setup() {
     gpio_set_dir(29, GPIO_IN);
     motor[0].init();
     motor[1].init();
+
+    motor[0].setVelGain(1, 0.0, 0.09);
+    motor[0].setPosGain(2.5, 0.0, 0.09);
+    motor[1].setVelGain(1, 0.0, 0.09);
+    motor[1].setPosGain(2.5, 0.0, 0.09);
+
     servo.init();
     initTimer();
 }
