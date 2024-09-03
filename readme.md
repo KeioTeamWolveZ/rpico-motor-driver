@@ -5,6 +5,9 @@ XIAO RP2040を用いてモータの速度・位置制御を行います．
 ## Requirements
 - [Raspberry Pi Pico VSCode Extension](https://marketplace.visualstudio.com/items?itemName=raspberry-pi.raspberry-pi-pico)
 
+## Environment
+- **Pico SDK v1.5.1** on Raspberry Pi Pico VSCode Extension
+
 ## How to build and upload
 ### 1. Clone Repo
 ```shell
@@ -13,6 +16,8 @@ git clone git@github.com:KeioTeamWolveZ/rpico-motor-driver.git --recurse-submodu
 
 ### 2. Import project
 ![screenshot1](https://github.com/KeioTeamWolveZ/rpico-motor-driver/assets/58695125/53a5289f-a410-49ab-803d-996aefd64429)
+> [!IMPORTANT]
+> SDKのバージョンをv1.5.1にすること．
 
 ### 3. Build
 右下の `Build UF2` をクリックする．
