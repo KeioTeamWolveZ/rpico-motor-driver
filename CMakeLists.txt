@@ -6,7 +6,7 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 1.5.1)
+set(sdkVersion 2.0.0)
 set(toolchainVersion 13_2_Rel1)
 set(picotoolVersion 1.5.1)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
@@ -14,19 +14,29 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico CACHE STRING "Board type")
+set(PICO_BOARD seeed_xiao_rp2350 CACHE STRING "Board type")
+set(MOTOR_UART_INSTANCE_INDEX 1 CACHE STRING "UART instance index: 0 for uart0, 1 for uart1")
+set(MOTOR_UART_TX_GPIO 20 CACHE STRING "XIAO RP2350 GPIO connected to board PICO_TX")
+set(MOTOR_UART_RX_GPIO 21 CACHE STRING "XIAO RP2350 GPIO connected to board PICO_RX")
+set(MOTOR_UART_BAUDRATE 115200 CACHE STRING "Motor command UART baudrate")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-if (PICO_SDK_VERSION_STRING VERSION_LESS "1.4.0")
-  message(FATAL_ERROR "Raspberry Pi Pico SDK version 1.4.0 (or later) required. Your version is ${PICO_SDK_VERSION_STRING}")
+if (PICO_SDK_VERSION_STRING VERSION_LESS "2.0.0")
+  message(FATAL_ERROR "Raspberry Pi Pico SDK version 2.0.0 (or later) required for XIAO RP2350. Your version is ${PICO_SDK_VERSION_STRING}")
 endif()
 
 project(rpico-motor-driver C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
+
+message(STATUS "rpico-motor-driver PICO_BOARD=${PICO_BOARD}")
+message(STATUS "rpico-motor-driver UART_INSTANCE=uart${MOTOR_UART_INSTANCE_INDEX}")
+message(STATUS "rpico-motor-driver UART_TX_GPIO=${MOTOR_UART_TX_GPIO}")
+message(STATUS "rpico-motor-driver UART_RX_GPIO=${MOTOR_UART_RX_GPIO}")
+message(STATUS "rpico-motor-driver UART_BAUDRATE=${MOTOR_UART_BAUDRATE}")
 
 # Add executable. Default name is the project name, version 0.1
 
@@ -40,7 +50,7 @@ add_executable(rpico-motor-driver
           )
 
 pico_set_program_name(rpico-motor-driver "rpico-motor-driver")
-pico_set_program_version(rpico-motor-driver "0.1")
+pico_set_program_version(rpico-motor-driver "0.2-xiao-rp2350-uart-debug")
 
 # Generate PIO header
 pico_generate_pio_header(rpico-motor-driver ${CMAKE_CURRENT_LIST_DIR}/encoder.pio)
@@ -49,9 +59,19 @@ pico_generate_pio_header(rpico-motor-driver ${CMAKE_CURRENT_LIST_DIR}/encoder.pi
 pico_enable_stdio_uart(rpico-motor-driver 1)
 pico_enable_stdio_usb(rpico-motor-driver 0)
 
+target_compile_definitions(rpico-motor-driver PRIVATE
+        MOTOR_FIRMWARE_VERSION="0.2-xiao-rp2350-uart-debug"
+        MOTOR_PICO_BOARD="${PICO_BOARD}"
+        MOTOR_UART_INSTANCE_INDEX=${MOTOR_UART_INSTANCE_INDEX}
+        MOTOR_UART_TX_GPIO=${MOTOR_UART_TX_GPIO}
+        MOTOR_UART_RX_GPIO=${MOTOR_UART_RX_GPIO}
+        MOTOR_UART_BAUDRATE=${MOTOR_UART_BAUDRATE}
+        )
+
 # Add the standard library to the build
 target_link_libraries(rpico-motor-driver
         pico_stdlib
+        pico_stdio_uart
         hardware_pwm
         )
 
