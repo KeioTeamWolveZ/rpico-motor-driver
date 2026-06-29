@@ -21,6 +21,8 @@ set(MOTOR_UART_RX_GPIO 21 CACHE STRING "XIAO RP2350 GPIO connected to board PICO
 set(MOTOR_UART_BAUDRATE 115200 CACHE STRING "Motor command UART baudrate")
 option(MOTOR_BUILD_DIAGNOSTIC "Build the UART/GPIO diagnostic firmware with no motor or servo control" ON)
 set(MOTOR_DIAGNOSTIC_FIRMWARE_ID "uart-gpio-diagnostic-no-motor-tx${MOTOR_UART_TX_GPIO}-rx${MOTOR_UART_RX_GPIO}" CACHE STRING "Diagnostic firmware ID")
+option(MOTOR_BUILD_SAFE_DIAGNOSTIC "Build the safe-output UART/GPIO diagnostic firmware" ON)
+set(MOTOR_SAFE_DIAGNOSTIC_FIRMWARE_ID "uart-gpio-diagnostic-safe-output-tx${MOTOR_UART_TX_GPIO}-rx${MOTOR_UART_RX_GPIO}" CACHE STRING "Safe-output diagnostic firmware ID")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -121,4 +123,37 @@ target_include_directories(rpico-motor-driver-diagnostic PRIVATE
 )
 
 pico_add_extra_outputs(rpico-motor-driver-diagnostic)
+endif()
+
+if (MOTOR_BUILD_SAFE_DIAGNOSTIC)
+add_executable(rpico-motor-driver-diagnostic-safe
+          diagnostic_safe_gpio.cpp
+          )
+
+pico_set_program_name(rpico-motor-driver-diagnostic-safe "rpico-motor-driver-diagnostic-safe")
+pico_set_program_version(rpico-motor-driver-diagnostic-safe "${MOTOR_SAFE_DIAGNOSTIC_FIRMWARE_ID}")
+
+pico_enable_stdio_uart(rpico-motor-driver-diagnostic-safe 1)
+pico_enable_stdio_usb(rpico-motor-driver-diagnostic-safe 1)
+
+target_compile_definitions(rpico-motor-driver-diagnostic-safe PRIVATE
+        MOTOR_SAFE_DIAGNOSTIC_FIRMWARE_ID="${MOTOR_SAFE_DIAGNOSTIC_FIRMWARE_ID}"
+        MOTOR_PICO_BOARD="${PICO_BOARD}"
+        MOTOR_UART_INSTANCE_INDEX=${MOTOR_UART_INSTANCE_INDEX}
+        MOTOR_UART_TX_GPIO=${MOTOR_UART_TX_GPIO}
+        MOTOR_UART_RX_GPIO=${MOTOR_UART_RX_GPIO}
+        MOTOR_UART_BAUDRATE=${MOTOR_UART_BAUDRATE}
+        )
+
+target_link_libraries(rpico-motor-driver-diagnostic-safe
+        pico_stdlib
+        pico_stdio_uart
+        pico_stdio_usb
+        )
+
+target_include_directories(rpico-motor-driver-diagnostic-safe PRIVATE
+  ${CMAKE_CURRENT_LIST_DIR}
+)
+
+pico_add_extra_outputs(rpico-motor-driver-diagnostic-safe)
 endif()
