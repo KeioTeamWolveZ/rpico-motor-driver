@@ -15,10 +15,36 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico CACHE STRING "Board type")
+
+if(DEFINED MOTOR_UART_ID)
+    set(DIAGNOSTIC_UART_ID_DEFAULT ${MOTOR_UART_ID})
+else()
+    set(DIAGNOSTIC_UART_ID_DEFAULT 1)
+endif()
+if(DEFINED MOTOR_UART_BAUDRATE)
+    set(DIAGNOSTIC_UART_BAUDRATE_DEFAULT ${MOTOR_UART_BAUDRATE})
+else()
+    set(DIAGNOSTIC_UART_BAUDRATE_DEFAULT 115200)
+endif()
+if(DEFINED MOTOR_UART_TX_GPIO)
+    set(DIAGNOSTIC_UART_TX_GPIO_DEFAULT ${MOTOR_UART_TX_GPIO})
+else()
+    set(DIAGNOSTIC_UART_TX_GPIO_DEFAULT 6)
+endif()
+if(DEFINED MOTOR_UART_RX_GPIO)
+    set(DIAGNOSTIC_UART_RX_GPIO_DEFAULT ${MOTOR_UART_RX_GPIO})
+else()
+    set(DIAGNOSTIC_UART_RX_GPIO_DEFAULT 7)
+endif()
+
 set(MOTOR_UART_ID 1 CACHE STRING "UART instance id: 0 for uart0, 1 for uart1")
 set(MOTOR_UART_BAUDRATE 115200 CACHE STRING "UART stdio baudrate")
 set(MOTOR_UART_TX_GPIO 20 CACHE STRING "UART stdio TX GPIO")
 set(MOTOR_UART_RX_GPIO 21 CACHE STRING "UART stdio RX GPIO")
+set(DIAGNOSTIC_UART_ID ${DIAGNOSTIC_UART_ID_DEFAULT} CACHE STRING "Diagnostic UART instance id: 0 for uart0, 1 for uart1")
+set(DIAGNOSTIC_UART_BAUDRATE ${DIAGNOSTIC_UART_BAUDRATE_DEFAULT} CACHE STRING "Diagnostic UART baudrate")
+set(DIAGNOSTIC_UART_TX_GPIO ${DIAGNOSTIC_UART_TX_GPIO_DEFAULT} CACHE STRING "Diagnostic UART TX GPIO")
+set(DIAGNOSTIC_UART_RX_GPIO ${DIAGNOSTIC_UART_RX_GPIO_DEFAULT} CACHE STRING "Diagnostic UART RX GPIO")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -85,3 +111,32 @@ target_link_libraries(rpico-motor-driver
 
 pico_add_extra_outputs(rpico-motor-driver)
 
+add_executable(rpico-motor-driver-diagnostic-uart-d6d7
+        diagnostic_uart_d6d7.cpp
+        )
+
+pico_set_program_name(rpico-motor-driver-diagnostic-uart-d6d7 "rpico-motor-driver-diagnostic-uart-d6d7")
+pico_set_program_version(rpico-motor-driver-diagnostic-uart-d6d7 "0.1")
+
+target_compile_definitions(rpico-motor-driver-diagnostic-uart-d6d7 PRIVATE
+        MOTOR_UART_ID=${DIAGNOSTIC_UART_ID}
+        MOTOR_UART_BAUDRATE=${DIAGNOSTIC_UART_BAUDRATE}
+        MOTOR_UART_TX_GPIO=${DIAGNOSTIC_UART_TX_GPIO}
+        MOTOR_UART_RX_GPIO=${DIAGNOSTIC_UART_RX_GPIO}
+        )
+
+message(STATUS "rpico-motor-driver-diagnostic-uart-d6d7 MOTOR_UART_ID=${DIAGNOSTIC_UART_ID}")
+message(STATUS "rpico-motor-driver-diagnostic-uart-d6d7 MOTOR_UART_BAUDRATE=${DIAGNOSTIC_UART_BAUDRATE}")
+message(STATUS "rpico-motor-driver-diagnostic-uart-d6d7 MOTOR_UART_TX_GPIO=${DIAGNOSTIC_UART_TX_GPIO}")
+message(STATUS "rpico-motor-driver-diagnostic-uart-d6d7 MOTOR_UART_RX_GPIO=${DIAGNOSTIC_UART_RX_GPIO}")
+
+target_link_libraries(rpico-motor-driver-diagnostic-uart-d6d7
+        pico_stdlib
+        pico_stdio_uart
+        hardware_uart
+        )
+
+pico_enable_stdio_uart(rpico-motor-driver-diagnostic-uart-d6d7 1)
+pico_enable_stdio_usb(rpico-motor-driver-diagnostic-uart-d6d7 0)
+
+pico_add_extra_outputs(rpico-motor-driver-diagnostic-uart-d6d7)
