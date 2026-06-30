@@ -1,7 +1,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
-#include <cstdlib>
+
 #include "../lib/rpico-encoder-plus/qenc.h"
 #include "../lib/rpico-motor/motor.h"
 #include "../lib/rpico-pwm/pwm.h"
@@ -9,13 +9,11 @@
 #include "hardware/pio.h"
 #include "hardware/uart.h"
 #include "pico/error.h"
-#include "pico/stdio.h"
 #include "pico/stdio_uart.h"
 #include "pico/stdlib.h"
-// #include "encoder.pio.h"
 
 #ifndef MOTOR_UART_ID
-#define MOTOR_UART_ID 1
+#define MOTOR_UART_ID 0
 #endif
 
 #ifndef MOTOR_UART_BAUDRATE
@@ -23,11 +21,39 @@
 #endif
 
 #ifndef MOTOR_UART_TX_GPIO
-#define MOTOR_UART_TX_GPIO 20
+#define MOTOR_UART_TX_GPIO 0
 #endif
 
 #ifndef MOTOR_UART_RX_GPIO
-#define MOTOR_UART_RX_GPIO 21
+#define MOTOR_UART_RX_GPIO 1
+#endif
+
+#ifndef MOTOR_SERVO_GPIO
+#define MOTOR_SERVO_GPIO 18
+#endif
+
+#ifndef MOTOR_PWM0_GPIO
+#define MOTOR_PWM0_GPIO 6
+#endif
+
+#ifndef MOTOR_PWM1_GPIO
+#define MOTOR_PWM1_GPIO 7
+#endif
+
+#ifndef MOTOR_PWM2_GPIO
+#define MOTOR_PWM2_GPIO 2
+#endif
+
+#ifndef MOTOR_PWM3_GPIO
+#define MOTOR_PWM3_GPIO 3
+#endif
+
+#ifndef MOTOR_QENC0_GPIO
+#define MOTOR_QENC0_GPIO 26
+#endif
+
+#ifndef MOTOR_QENC1_GPIO
+#define MOTOR_QENC1_GPIO 28
 #endif
 
 #if MOTOR_UART_ID == 0
@@ -41,12 +67,9 @@
 #ifdef PICO_DEFAULT_LED_PIN
 static const uint LED_PIN = PICO_DEFAULT_LED_PIN;
 #else
-// Pico SDK seeed_xiao_rp2350.h defines the XIAO RP2350 user LED as GPIO25.
 static const uint LED_PIN = 25;
 #endif
 
-// XIAO user LEDs are commonly active-low. Flip these two constants if the
-// mounted board lights the LED with a high output instead.
 static const bool LED_ON = false;
 static const bool LED_OFF = true;
 static const uint32_t MORSE_DOT_MS = 150;
@@ -55,13 +78,17 @@ static const uint32_t MORSE_SYMBOL_GAP_MS = 150;
 static const uint32_t MORSE_CHAR_GAP_MS = 1000;
 static const uint32_t LOOP_ALIVE_SERVICE_US = 10000;
 
-Pwm pwm[4] = {Pwm(6, 50000), Pwm(7, 50000), Pwm(2, 50000), Pwm(3, 50000)};
-Servo servo(0);
-Qenc enc[2] = {Qenc(26), Qenc(28)};
-
+Pwm pwm[4] = {
+    Pwm(MOTOR_PWM0_GPIO, 50000),
+    Pwm(MOTOR_PWM1_GPIO, 50000),
+    Pwm(MOTOR_PWM2_GPIO, 50000),
+    Pwm(MOTOR_PWM3_GPIO, 50000),
+};
+Servo servo(MOTOR_SERVO_GPIO);
+Qenc enc[2] = {Qenc(MOTOR_QENC0_GPIO), Qenc(MOTOR_QENC1_GPIO)};
 Motor motor[2] = {Motor(pwm[3], pwm[0], enc[0]), Motor(pwm[1], pwm[2], enc[1])};
 
-char buf[255];
+static char buf[255];
 static char current_led_char = 'L';
 static const char* current_led_pattern = ".-..";
 static bool led_active = false;
@@ -69,17 +96,55 @@ static bool led_symbol_on = false;
 static int led_pattern_index = 0;
 static uint64_t led_next_event_us = 0;
 
-void led_write(bool on) {
+static bool motors_runtime_enabled = false;
+static bool motors_initialized = false;
+static bool servo_runtime_enabled = false;
+static bool servo_initialized = false;
+static bool timer_started = false;
+static repeating_timer_t velocity_timer;
+static repeating_timer_t position_timer;
+
+static bool pin_is_uart(int pin) {
+    return pin == MOTOR_UART_TX_GPIO || pin == MOTOR_UART_RX_GPIO;
+}
+
+static bool motors_pin_conflict() {
+    return pin_is_uart(MOTOR_PWM0_GPIO) || pin_is_uart(MOTOR_PWM1_GPIO) ||
+           pin_is_uart(MOTOR_PWM2_GPIO) || pin_is_uart(MOTOR_PWM3_GPIO) ||
+           pin_is_uart(MOTOR_QENC0_GPIO) || pin_is_uart(MOTOR_QENC0_GPIO + 1) ||
+           pin_is_uart(MOTOR_QENC1_GPIO) || pin_is_uart(MOTOR_QENC1_GPIO + 1);
+}
+
+static bool servo_pin_conflict() {
+    return pin_is_uart(MOTOR_SERVO_GPIO);
+}
+
+static void print_pin_conflict_value() {
+    bool any = false;
+    if (motors_pin_conflict()) {
+        printf("motors");
+        any = true;
+    }
+    if (servo_pin_conflict()) {
+        printf("%sservo", any ? "," : "");
+        any = true;
+    }
+    if (!any) {
+        printf("none");
+    }
+}
+
+static void led_write(bool on) {
     gpio_put(LED_PIN, on ? LED_ON : LED_OFF);
 }
 
-void init_led() {
+static void init_led() {
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     led_write(false);
 }
 
-const char* morse_pattern_for(char led_char) {
+static const char* morse_pattern_for(char led_char) {
     switch (led_char) {
         case 'B':
             return "-...";
@@ -114,7 +179,7 @@ const char* morse_pattern_for(char led_char) {
     }
 }
 
-bool set_led_char(char led_char) {
+static bool set_led_char(char led_char) {
     led_char = (char)toupper((unsigned char)led_char);
     const char* pattern = morse_pattern_for(led_char);
     if (pattern == NULL) {
@@ -131,17 +196,7 @@ bool set_led_char(char led_char) {
     return true;
 }
 
-char uart_pin_led_char() {
-    if (MOTOR_UART_TX_GPIO == 20 && MOTOR_UART_RX_GPIO == 21) {
-        return 'A';
-    }
-    if (MOTOR_UART_TX_GPIO == 21 && MOTOR_UART_RX_GPIO == 20) {
-        return 'N';
-    }
-    return 'E';
-}
-
-void init_uart_stdio() {
+static void init_uart_stdio() {
     stdio_uart_init_full(
         MOTOR_UART_INSTANCE,
         MOTOR_UART_BAUDRATE,
@@ -149,18 +204,18 @@ void init_uart_stdio() {
         MOTOR_UART_RX_GPIO);
 }
 
-uint32_t morse_symbol_on_ms(char symbol) {
+static uint32_t morse_symbol_on_ms(char symbol) {
     return symbol == '-' ? MORSE_DASH_MS : MORSE_DOT_MS;
 }
 
-char* skip_spaces(char* text) {
+static char* skip_spaces(char* text) {
     while (*text != 0 && isspace((unsigned char)*text)) {
         ++text;
     }
     return text;
 }
 
-char* read_upper_token(char* text, char* token, int token_size) {
+static char* read_upper_token(char* text, char* token, int token_size) {
     text = skip_spaces(text);
     int i = 0;
     while (*text != 0 && !isspace((unsigned char)*text)) {
@@ -173,82 +228,7 @@ char* read_upper_token(char* text, char* token, int token_size) {
     return text;
 }
 
-void print_uart_status() {
-    printf("UART_ID=%d TX=%d RX=%d BAUD=%d LED=%c\n",
-           MOTOR_UART_ID,
-           MOTOR_UART_TX_GPIO,
-           MOTOR_UART_RX_GPIO,
-           MOTOR_UART_BAUDRATE,
-           current_led_char);
-}
-
-void print_help() {
-    printf("COMMANDS: LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, PING, STATUS, STOP, HELP\n");
-    printf("MOTOR: <id> <mode> <val>\n");
-}
-
-bool handle_diag_command(char* line) {
-    char command[16];
-    char* rest = read_upper_token(line, command, sizeof(command));
-    if (command[0] == 0) {
-        return false;
-    }
-
-    if (strcmp(command, "LED") == 0) {
-        rest = skip_spaces(rest);
-        if (*rest == 0) {
-            set_led_char('I');
-            printf("ERR LED missing\n");
-            fflush(stdout);
-            return true;
-        }
-
-        char led_char = (char)toupper((unsigned char)*rest);
-        if (!set_led_char(led_char)) {
-            set_led_char('I');
-            printf("ERR LED unsupported char=%c\n", led_char);
-            fflush(stdout);
-            return true;
-        }
-
-        printf("OK LED %c\n", current_led_char);
-        fflush(stdout);
-        return true;
-    }
-
-    if (strcmp(command, "PING") == 0) {
-        set_led_char('P');
-        printf("PONG\n");
-        fflush(stdout);
-        return true;
-    }
-
-    if (strcmp(command, "STATUS") == 0) {
-        set_led_char('P');
-        print_uart_status();
-        fflush(stdout);
-        return true;
-    }
-
-    if (strcmp(command, "STOP") == 0) {
-        // No existing project-level safe stop helper is present in this old base.
-        set_led_char('I');
-        printf("ERR STOP unsupported\n");
-        fflush(stdout);
-        return true;
-    }
-
-    if (strcmp(command, "HELP") == 0) {
-        set_led_char('P');
-        print_help();
-        fflush(stdout);
-        return true;
-    }
-
-    return false;
-}
-
-void service_led() {
+static void service_led() {
     uint64_t now_us = time_us_64();
     if (led_next_event_us != 0 && now_us < led_next_event_us) {
         return;
@@ -289,9 +269,250 @@ void service_led() {
         now_us + morse_symbol_on_ms(current_led_pattern[led_pattern_index]) * 1000;
 }
 
-bool readline(char* buf, int buf_size) {
+static bool timer_cb(repeating_timer_t* rt) {
+    if (!motors_runtime_enabled) {
+        return timer_started;
+    }
+    motor[0].timer_cb();
+    motor[1].timer_cb();
+    return timer_started;
+}
+
+static bool timer_cb_pos(repeating_timer_t* rt) {
+    if (!motors_runtime_enabled) {
+        return timer_started;
+    }
+    motor[0].timer_cb_pos();
+    motor[1].timer_cb_pos();
+    return timer_started;
+}
+
+static void start_motor_timers() {
+    if (timer_started) {
+        return;
+    }
+    add_repeating_timer_ms(-10, timer_cb, NULL, &velocity_timer);
+    add_repeating_timer_ms(-100, timer_cb_pos, NULL, &position_timer);
+    timer_started = true;
+}
+
+static void stop_motor_timers() {
+    if (!timer_started) {
+        return;
+    }
+    cancel_repeating_timer(&velocity_timer);
+    cancel_repeating_timer(&position_timer);
+    timer_started = false;
+}
+
+static void stop_motors_if_enabled() {
+    if (!motors_initialized) {
+        return;
+    }
+    motor[0].disablePosPid();
+    motor[1].disablePosPid();
+    motor[0].setVel(0);
+    motor[1].setVel(0);
+}
+
+static void configure_motor_gains() {
+    motor[0].setVelGain(1, 0.0, 0.09);
+    motor[0].setPosGain(2.5, 0.0, 0.09);
+    motor[1].setVelGain(1, 0.0, 0.09);
+    motor[1].setPosGain(2.5, 0.0, 0.09);
+}
+
+static bool enable_motors() {
+    if (motors_pin_conflict()) {
+        return false;
+    }
+
+    if (!motors_initialized) {
+        gpio_set_dir(MOTOR_QENC0_GPIO, GPIO_IN);
+        gpio_set_dir(MOTOR_QENC0_GPIO + 1, GPIO_IN);
+        gpio_set_dir(MOTOR_QENC1_GPIO, GPIO_IN);
+        gpio_set_dir(MOTOR_QENC1_GPIO + 1, GPIO_IN);
+        motor[0].init();
+        motor[1].init();
+        configure_motor_gains();
+        motors_initialized = true;
+    }
+
+    motors_runtime_enabled = true;
+    stop_motors_if_enabled();
+    start_motor_timers();
+    return true;
+}
+
+static void disable_motors() {
+    stop_motors_if_enabled();
+    motors_runtime_enabled = false;
+    stop_motor_timers();
+}
+
+static bool enable_servo() {
+    if (servo_pin_conflict()) {
+        return false;
+    }
+    if (!servo_initialized) {
+        servo.init();
+        servo_initialized = true;
+    }
+    servo_runtime_enabled = true;
+    return true;
+}
+
+static void disable_servo() {
+    servo_runtime_enabled = false;
+}
+
+static void safe_all() {
+    disable_motors();
+    disable_servo();
+}
+
+static void print_status() {
+    printf("FW=NORMAL UART_ID=%d TX=%d RX=%d BAUD=%d "
+           "MOTORS_ENABLED=%d SERVO_ENABLED=%d TIMER_STARTED=%d "
+           "PWM=%d,%d,%d,%d SERVO_GPIO=%d QENC=%d,%d LED=%c PIN_CONFLICT=",
+           MOTOR_UART_ID,
+           MOTOR_UART_TX_GPIO,
+           MOTOR_UART_RX_GPIO,
+           MOTOR_UART_BAUDRATE,
+           motors_runtime_enabled ? 1 : 0,
+           servo_runtime_enabled ? 1 : 0,
+           timer_started ? 1 : 0,
+           MOTOR_PWM0_GPIO,
+           MOTOR_PWM1_GPIO,
+           MOTOR_PWM2_GPIO,
+           MOTOR_PWM3_GPIO,
+           MOTOR_SERVO_GPIO,
+           MOTOR_QENC0_GPIO,
+           MOTOR_QENC1_GPIO,
+           current_led_char);
+    print_pin_conflict_value();
+    printf("\n");
+}
+
+static void print_help() {
+    printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
+           "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
+           "motor commands\n");
+    printf("MOTOR: <id> <mode> <val>\n");
+}
+
+static bool handle_text_command(char* line) {
+    char command[20];
+    char* rest = read_upper_token(line, command, sizeof(command));
+    if (command[0] == 0) {
+        return true;
+    }
+
+    if (strcmp(command, "LED") == 0) {
+        rest = skip_spaces(rest);
+        if (*rest == 0) {
+            set_led_char('I');
+            printf("ERR LED missing\n");
+            fflush(stdout);
+            return true;
+        }
+
+        char led_char = (char)toupper((unsigned char)*rest);
+        if (!set_led_char(led_char)) {
+            set_led_char('I');
+            printf("ERR LED unsupported char=%c\n", led_char);
+            fflush(stdout);
+            return true;
+        }
+
+        printf("OK LED %c\n", current_led_char);
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "PING") == 0) {
+        set_led_char('P');
+        printf("PONG\n");
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "STATUS") == 0) {
+        print_status();
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "HELP") == 0) {
+        print_help();
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "STOP") == 0) {
+        stop_motors_if_enabled();
+        set_led_char('S');
+        printf("OK STOP\n");
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "SAFE") == 0) {
+        safe_all();
+        set_led_char('S');
+        printf("OK SAFE\n");
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "MOTOR_ENABLE") == 0) {
+        if (!enable_motors()) {
+            set_led_char('E');
+            printf("ERR PIN_CONFLICT MOTORS\n");
+            fflush(stdout);
+            return true;
+        }
+        set_led_char('M');
+        printf("OK MOTOR_ENABLE\n");
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "MOTOR_DISABLE") == 0) {
+        disable_motors();
+        set_led_char('S');
+        printf("OK MOTOR_DISABLE\n");
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "SERVO_ENABLE") == 0) {
+        if (!enable_servo()) {
+            set_led_char('E');
+            printf("ERR PIN_CONFLICT SERVO\n");
+            fflush(stdout);
+            return true;
+        }
+        set_led_char('A');
+        printf("OK SERVO_ENABLE\n");
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "SERVO_DISABLE") == 0) {
+        disable_servo();
+        set_led_char('S');
+        printf("OK SERVO_DISABLE\n");
+        fflush(stdout);
+        return true;
+    }
+
+    return false;
+}
+
+static bool readline(char* line, int line_size) {
     int i = 0;
-    while (1) {
+    while (true) {
         int c_raw = getchar_timeout_us(LOOP_ALIVE_SERVICE_US);
         service_led();
         if (c_raw == PICO_ERROR_TIMEOUT) {
@@ -305,8 +526,8 @@ bool readline(char* buf, int buf_size) {
         if (c == '\r') {
             continue;
         }
-        if (i >= buf_size - 1) {
-            buf[buf_size - 1] = 0;
+        if (i >= line_size - 1) {
+            line[line_size - 1] = 0;
             while (c != '\n') {
                 c_raw = getchar_timeout_us(LOOP_ALIVE_SERVICE_US);
                 service_led();
@@ -317,61 +538,19 @@ bool readline(char* buf, int buf_size) {
             }
             return false;
         }
-        buf[i++] = c;
+        line[i++] = c;
     }
-    buf[i] = 0;
+    line[i] = 0;
     return true;
-}
-
-bool timer_cb(repeating_timer_t* rt) {
-    motor[0].timer_cb();
-    motor[1].timer_cb();
-    return true;
-}
-
-bool timer_cb_pos(repeating_timer_t* rt) {
-    motor[0].timer_cb_pos();
-    motor[1].timer_cb_pos();
-    return true;
-}
-
-void initTimer() {
-    static repeating_timer_t timer;
-    static repeating_timer_t timer1;
-    add_repeating_timer_ms(-10, timer_cb, NULL, &timer);
-    add_repeating_timer_ms(-100, timer_cb_pos, NULL, &timer1);
-}
-
-void setup() {
-    printf("DBG setup start\n");
-    gpio_set_dir(26, GPIO_IN);
-    gpio_set_dir(27, GPIO_IN);
-    gpio_set_dir(28, GPIO_IN);
-    gpio_set_dir(29, GPIO_IN);
-    motor[0].init();
-    motor[1].init();
-
-    motor[0].setVelGain(1, 0.0, 0.09);
-    motor[0].setPosGain(2.5, 0.0, 0.09);
-    motor[1].setVelGain(1, 0.0, 0.09);
-    motor[1].setPosGain(2.5, 0.0, 0.09);
-
-    servo.init();
-    initTimer();
-    printf("DBG setup done\n");
 }
 
 int main() {
     init_led();
-    set_led_char('B');
-    set_led_char('U');
     init_uart_stdio();
-    set_led_char('O');
-    printf("DBG boot\n");
-    set_led_char('M');
-    setup();
-    set_led_char(uart_pin_led_char());
-    printf("DBG loop start\n");
+    set_led_char('L');
+    printf("FW NORMAL SAFE BOOT\n");
+    fflush(stdout);
+
     while (true) {
         service_led();
         if (!readline(buf, sizeof(buf))) {
@@ -380,9 +559,9 @@ int main() {
             fflush(stdout);
             continue;
         }
+
         set_led_char('R');
-        printf("DBG rx raw=\"%s\"\n", buf);
-        if (handle_diag_command(buf)) {
+        if (handle_text_command(buf)) {
             continue;
         }
 
@@ -396,12 +575,22 @@ int main() {
             fflush(stdout);
             continue;
         }
-        set_led_char('P');
-        printf("DBG parsed id=%d mode=%d val=%.3f\n", id, mode, val);
 
         if (id < 0 || id > 2) {
             set_led_char('I');
             printf("ERR id out_of_range id=%d\n", id);
+            fflush(stdout);
+            continue;
+        }
+        if ((id == 0 || id == 1) && !motors_runtime_enabled) {
+            set_led_char('E');
+            printf("ERR MOTORS_DISABLED\n");
+            fflush(stdout);
+            continue;
+        }
+        if (id == 2 && !servo_runtime_enabled) {
+            set_led_char('E');
+            printf("ERR SERVO_DISABLED\n");
             fflush(stdout);
             continue;
         }
