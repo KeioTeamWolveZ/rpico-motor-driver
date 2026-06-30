@@ -1,2 +1,22 @@
 build/
 .vscode/
+# CMake / Pico SDK build outputs
+build/
+build-*/
+cmake-build-*/
+
+# Pico SDK generated artifacts
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+*.dis
+*.elf.map
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+_deps/
