@@ -37,15 +37,33 @@ else()
     set(DIAGNOSTIC_UART_RX_GPIO_DEFAULT 7)
 endif()
 
-set(MOTOR_UART_ID 0 CACHE STRING "UART instance id: 0 for uart0, 1 for uart1")
-set(MOTOR_UART_BAUDRATE 115200 CACHE STRING "UART stdio baudrate")
-set(MOTOR_UART_TX_GPIO 0 CACHE STRING "UART stdio TX GPIO")
-set(MOTOR_UART_RX_GPIO 1 CACHE STRING "UART stdio RX GPIO")
+# ============================================================
+# WolveZ 2026 XIAO RP2350 hardware profile
+# ------------------------------------------------------------
+# These defaults are for the 2026 motor-driver board.
+# They can still be overridden by -D... CMake arguments.
+#
+# UART:
+#   Raspberry Pi GPIO12 / TXD5 -> XIAO RX GPIO1
+#   Raspberry Pi GPIO13 / RXD5 <- XIAO TX GPIO0
+#
+# Motor direct GPIO diagnostic result:
+#   GPIO11 -> motor1 clockwise
+#   GPIO20 -> motor1 counter-clockwise
+#   GPIO12 -> motor2 counter-clockwise
+#   GPIO21 -> motor2 clockwise
+# ============================================================
+set(MOTOR_UART_ID 0 CACHE STRING "UART id for Raspberry Pi link")
+set(MOTOR_UART_BAUDRATE 115200 CACHE STRING "UART baudrate for Raspberry Pi link")
+set(MOTOR_UART_TX_GPIO 0 CACHE STRING "XIAO UART TX GPIO")
+set(MOTOR_UART_RX_GPIO 1 CACHE STRING "XIAO UART RX GPIO")
+
+set(MOTOR_PWM0_GPIO 20 CACHE STRING "Motor PWM0 GPIO")
+set(MOTOR_PWM1_GPIO 21 CACHE STRING "Motor PWM1 GPIO")
+set(MOTOR_PWM2_GPIO 12 CACHE STRING "Motor PWM2 GPIO")
+set(MOTOR_PWM3_GPIO 11 CACHE STRING "Motor PWM3 GPIO")
+
 set(MOTOR_SERVO_GPIO 18 CACHE STRING "Servo GPIO")
-set(MOTOR_PWM0_GPIO 6 CACHE STRING "PWM0 GPIO")
-set(MOTOR_PWM1_GPIO 7 CACHE STRING "PWM1 GPIO")
-set(MOTOR_PWM2_GPIO 2 CACHE STRING "PWM2 GPIO")
-set(MOTOR_PWM3_GPIO 3 CACHE STRING "PWM3 GPIO")
 set(MOTOR_QENC0_GPIO 26 CACHE STRING "QENC0 GPIO")
 set(MOTOR_QENC1_GPIO 28 CACHE STRING "QENC1 GPIO")
 set(DIAGNOSTIC_UART_ID ${DIAGNOSTIC_UART_ID_DEFAULT} CACHE STRING "Diagnostic UART instance id: 0 for uart0, 1 for uart1")
