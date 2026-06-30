@@ -5,10 +5,36 @@
 #include "../lib/rpico-pwm/pwm.h"
 #include "../lib/rpico-servo/servo.h"
 #include "hardware/pio.h"
+#include "hardware/uart.h"
 #include "pico/error.h"
 #include "pico/stdio.h"
+#include "pico/stdio_uart.h"
 #include "pico/stdlib.h"
 // #include "encoder.pio.h"
+
+#ifndef MOTOR_UART_ID
+#define MOTOR_UART_ID 1
+#endif
+
+#ifndef MOTOR_UART_BAUDRATE
+#define MOTOR_UART_BAUDRATE 115200
+#endif
+
+#ifndef MOTOR_UART_TX_GPIO
+#define MOTOR_UART_TX_GPIO 20
+#endif
+
+#ifndef MOTOR_UART_RX_GPIO
+#define MOTOR_UART_RX_GPIO 21
+#endif
+
+#if MOTOR_UART_ID == 0
+#define MOTOR_UART_INSTANCE uart0
+#elif MOTOR_UART_ID == 1
+#define MOTOR_UART_INSTANCE uart1
+#else
+#error "MOTOR_UART_ID must be 0 or 1"
+#endif
 
 #ifdef PICO_DEFAULT_LED_PIN
 static const uint LED_PIN = PICO_DEFAULT_LED_PIN;
@@ -78,6 +104,27 @@ void blink_error_forever() {
         blink_dot();
         sleep_ms(MORSE_SYMBOL_GAP_MS);
     }
+}
+
+void blink_uart_pin_pattern() {
+    if (MOTOR_UART_TX_GPIO == 20 && MOTOR_UART_RX_GPIO == 21) {
+        blink_morse(".-");
+    } else if (MOTOR_UART_TX_GPIO == 21 && MOTOR_UART_RX_GPIO == 20) {
+        blink_morse("-.");
+    } else {
+        // Undefined UART pin pattern: show E three times so it is visible.
+        blink_morse(".");
+        blink_morse(".");
+        blink_morse(".");
+    }
+}
+
+void init_uart_stdio() {
+    stdio_uart_init_full(
+        MOTOR_UART_INSTANCE,
+        MOTOR_UART_BAUDRATE,
+        MOTOR_UART_TX_GPIO,
+        MOTOR_UART_RX_GPIO);
 }
 
 uint32_t morse_symbol_on_ms(char symbol) {
@@ -219,8 +266,9 @@ int main() {
     // initialization order stays intact while boot progress is visible.
     blink_morse("-...");
     blink_morse("..-");
-    stdio_init_all();
+    init_uart_stdio();
     blink_morse("---");
+    blink_uart_pin_pattern();
     printf("DBG boot\n");
     blink_morse("--");
     setup();

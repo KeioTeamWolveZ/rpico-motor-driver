@@ -15,6 +15,10 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico CACHE STRING "Board type")
+set(MOTOR_UART_ID 1 CACHE STRING "UART instance id: 0 for uart0, 1 for uart1")
+set(MOTOR_UART_BAUDRATE 115200 CACHE STRING "UART stdio baudrate")
+set(MOTOR_UART_TX_GPIO 20 CACHE STRING "UART stdio TX GPIO")
+set(MOTOR_UART_RX_GPIO 21 CACHE STRING "UART stdio RX GPIO")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -49,9 +53,22 @@ pico_generate_pio_header(rpico-motor-driver ${CMAKE_CURRENT_LIST_DIR}/encoder.pi
 pico_enable_stdio_uart(rpico-motor-driver 1)
 pico_enable_stdio_usb(rpico-motor-driver 0)
 
+target_compile_definitions(rpico-motor-driver PRIVATE
+        MOTOR_UART_ID=${MOTOR_UART_ID}
+        MOTOR_UART_BAUDRATE=${MOTOR_UART_BAUDRATE}
+        MOTOR_UART_TX_GPIO=${MOTOR_UART_TX_GPIO}
+        MOTOR_UART_RX_GPIO=${MOTOR_UART_RX_GPIO}
+        )
+
+message(STATUS "rpico-motor-driver MOTOR_UART_ID=${MOTOR_UART_ID}")
+message(STATUS "rpico-motor-driver MOTOR_UART_BAUDRATE=${MOTOR_UART_BAUDRATE}")
+message(STATUS "rpico-motor-driver MOTOR_UART_TX_GPIO=${MOTOR_UART_TX_GPIO}")
+message(STATUS "rpico-motor-driver MOTOR_UART_RX_GPIO=${MOTOR_UART_RX_GPIO}")
+
 # Add the standard library to the build
 target_link_libraries(rpico-motor-driver
         pico_stdlib
+        pico_stdio_uart
         hardware_pwm
         )
 
