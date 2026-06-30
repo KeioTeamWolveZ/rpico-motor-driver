@@ -7,6 +7,7 @@
 #include "../lib/rpico-pwm/pwm.h"
 #include "../lib/rpico-servo/servo.h"
 #include "hardware/pio.h"
+#include "hardware/pwm.h"
 #include "hardware/uart.h"
 #include "pico/error.h"
 #include "pico/stdio_uart.h"
@@ -77,6 +78,8 @@ static const uint32_t MORSE_DASH_MS = 500;
 static const uint32_t MORSE_SYMBOL_GAP_MS = 150;
 static const uint32_t MORSE_CHAR_GAP_MS = 1000;
 static const uint32_t LOOP_ALIVE_SERVICE_US = 10000;
+static const int DIAG_MAX_GPIO = 29;
+static const int DIAG_PWM_FREQ = 50000;
 
 Pwm pwm[4] = {
     Pwm(MOTOR_PWM0_GPIO, 50000),
@@ -103,6 +106,10 @@ static bool servo_initialized = false;
 static bool timer_started = false;
 static repeating_timer_t velocity_timer;
 static repeating_timer_t position_timer;
+static bool diag_high[DIAG_MAX_GPIO + 1] = {false};
+static bool diag_pwm[DIAG_MAX_GPIO + 1] = {false};
+
+static bool set_led_char(char led_char);
 
 static bool pin_is_uart(int pin) {
     return pin == MOTOR_UART_TX_GPIO || pin == MOTOR_UART_RX_GPIO;
@@ -117,6 +124,46 @@ static bool motors_pin_conflict() {
 
 static bool servo_pin_conflict() {
     return pin_is_uart(MOTOR_SERVO_GPIO);
+}
+
+static bool diag_gpio_valid(int gpio) {
+    return gpio >= 0 && gpio <= DIAG_MAX_GPIO;
+}
+
+static bool diag_gpio_protected(int gpio) {
+    return gpio == 0 || gpio == 1 || gpio == 22 || gpio == 23 || gpio == 25;
+}
+
+static bool diag_runtime_available() {
+    if (motors_runtime_enabled) {
+        printf("ERR MOTORS_ENABLED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return false;
+    }
+    if (servo_runtime_enabled) {
+        printf("ERR SERVO_ENABLED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return false;
+    }
+    return true;
+}
+
+static bool diag_validate_gpio(int gpio) {
+    if (!diag_gpio_valid(gpio)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return false;
+    }
+    if (diag_gpio_protected(gpio)) {
+        printf("ERR PROTECTED_PIN\n");
+        fflush(stdout);
+        set_led_char('E');
+        return false;
+    }
+    return true;
 }
 
 static void print_pin_conflict_value() {
@@ -269,6 +316,244 @@ static void service_led() {
         now_us + morse_symbol_on_ms(current_led_pattern[led_pattern_index]) * 1000;
 }
 
+static void wait_ms_with_led(uint32_t ms) {
+    absolute_time_t until = make_timeout_time_ms(ms);
+    while (!time_reached(until)) {
+        service_led();
+        sleep_ms(5);
+    }
+}
+
+static void print_diag_gpio_list(const bool* values) {
+    bool any = false;
+    for (int gpio = 0; gpio <= DIAG_MAX_GPIO; ++gpio) {
+        if (!values[gpio]) {
+            continue;
+        }
+        if (any) {
+            printf(",");
+        }
+        printf("%d", gpio);
+        any = true;
+    }
+    if (!any) {
+        printf("none");
+    }
+}
+
+static void diag_pwm_stop_gpio(int gpio) {
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    uint channel = pwm_gpio_to_channel(gpio);
+    pwm_set_chan_level(slice, channel, 0);
+    pwm_set_enabled(slice, false);
+    gpio_init(gpio);
+    gpio_set_dir(gpio, GPIO_OUT);
+    gpio_put(gpio, 0);
+    if (diag_gpio_valid(gpio)) {
+        diag_pwm[gpio] = false;
+        diag_high[gpio] = false;
+    }
+}
+
+static void diag_gpio_low(int gpio) {
+    if (diag_pwm[gpio]) {
+        diag_pwm_stop_gpio(gpio);
+        return;
+    }
+    gpio_init(gpio);
+    gpio_set_dir(gpio, GPIO_OUT);
+    gpio_put(gpio, 0);
+    diag_high[gpio] = false;
+}
+
+static void diag_all_low() {
+    for (int gpio = 0; gpio <= DIAG_MAX_GPIO; ++gpio) {
+        if (diag_gpio_protected(gpio)) {
+            continue;
+        }
+        if (diag_high[gpio] || diag_pwm[gpio]) {
+            diag_gpio_low(gpio);
+        }
+    }
+}
+
+static void print_pin_status() {
+    printf("PIN_STATUS PROTECTED=0,1,22,23,25 DIAG_HIGH=");
+    print_diag_gpio_list(diag_high);
+    printf(" DIAG_PWM=");
+    print_diag_gpio_list(diag_pwm);
+    printf(" MAX_GPIO=%d\n", DIAG_MAX_GPIO);
+}
+
+static bool parse_one_int(char* text, int* a) {
+    return sscanf(text, "%d", a) == 1;
+}
+
+static bool parse_two_ints(char* text, int* a, int* b) {
+    return sscanf(text, "%d %d", a, b) == 2;
+}
+
+static bool parse_three_ints(char* text, int* a, int* b, int* c) {
+    return sscanf(text, "%d %d %d", a, b, c) == 3;
+}
+
+static void handle_gpio_read(char* rest) {
+    int gpio = -1;
+    if (!parse_one_int(rest, &gpio)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!diag_runtime_available() || !diag_validate_gpio(gpio)) {
+        return;
+    }
+
+    gpio_init(gpio);
+    gpio_set_dir(gpio, GPIO_IN);
+    diag_high[gpio] = false;
+    diag_pwm[gpio] = false;
+    printf("GPIO %d LEVEL=%d\n", gpio, gpio_get(gpio) ? 1 : 0);
+    fflush(stdout);
+    set_led_char('D');
+}
+
+static void handle_gpio_high(char* rest) {
+    int gpio = -1;
+    if (!parse_one_int(rest, &gpio)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!diag_runtime_available() || !diag_validate_gpio(gpio)) {
+        return;
+    }
+
+    if (diag_pwm[gpio]) {
+        diag_pwm_stop_gpio(gpio);
+    }
+    gpio_init(gpio);
+    gpio_set_dir(gpio, GPIO_OUT);
+    gpio_put(gpio, 1);
+    diag_high[gpio] = true;
+    printf("OK GPIO_HIGH %d\n", gpio);
+    fflush(stdout);
+    set_led_char('D');
+}
+
+static void handle_gpio_low(char* rest) {
+    int gpio = -1;
+    if (!parse_one_int(rest, &gpio)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!diag_runtime_available() || !diag_validate_gpio(gpio)) {
+        return;
+    }
+
+    diag_gpio_low(gpio);
+    printf("OK GPIO_LOW %d\n", gpio);
+    fflush(stdout);
+    set_led_char('D');
+}
+
+static void handle_gpio_pulse(char* rest) {
+    int gpio = -1;
+    int ms = 0;
+    if (!parse_two_ints(rest, &gpio, &ms)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!diag_runtime_available() || !diag_validate_gpio(gpio)) {
+        return;
+    }
+    if (ms <= 0 || ms > 1000) {
+        printf("ERR INVALID_MS\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+
+    if (diag_pwm[gpio]) {
+        diag_pwm_stop_gpio(gpio);
+    }
+    gpio_init(gpio);
+    gpio_set_dir(gpio, GPIO_OUT);
+    gpio_put(gpio, 1);
+    diag_high[gpio] = true;
+    wait_ms_with_led((uint32_t)ms);
+    gpio_put(gpio, 0);
+    diag_high[gpio] = false;
+    printf("OK GPIO_PULSE %d %d\n", gpio, ms);
+    fflush(stdout);
+    set_led_char('D');
+}
+
+static void handle_pwm_test(char* rest) {
+    int gpio = -1;
+    int duty_percent = 0;
+    int ms = 0;
+    if (!parse_three_ints(rest, &gpio, &duty_percent, &ms)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!diag_runtime_available() || !diag_validate_gpio(gpio)) {
+        return;
+    }
+    if (duty_percent < 0 || duty_percent > 50) {
+        printf("ERR INVALID_DUTY\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (ms <= 0 || ms > 1000) {
+        printf("ERR INVALID_MS\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    uint channel = pwm_gpio_to_channel(gpio);
+    pwm_set_clkdiv(slice, (float)125E6 / (2048 * DIAG_PWM_FREQ));
+    pwm_set_wrap(slice, 2047);
+    pwm_set_chan_level(slice, channel, (uint16_t)(2047 * duty_percent / 100));
+    pwm_set_enabled(slice, true);
+    diag_pwm[gpio] = true;
+    diag_high[gpio] = false;
+    wait_ms_with_led((uint32_t)ms);
+    diag_pwm_stop_gpio(gpio);
+    printf("OK PWM_TEST %d duty=%d ms=%d\n", gpio, duty_percent, ms);
+    fflush(stdout);
+    set_led_char('D');
+}
+
+static void handle_pwm_off(char* rest) {
+    int gpio = -1;
+    if (!parse_one_int(rest, &gpio)) {
+        printf("ERR INVALID_GPIO\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!diag_runtime_available() || !diag_validate_gpio(gpio)) {
+        return;
+    }
+
+    diag_pwm_stop_gpio(gpio);
+    printf("OK PWM_OFF %d\n", gpio);
+    fflush(stdout);
+    set_led_char('D');
+}
+
 static bool timer_cb(repeating_timer_t* rt) {
     if (!motors_runtime_enabled) {
         return timer_started;
@@ -369,6 +654,7 @@ static void disable_servo() {
 static void safe_all() {
     disable_motors();
     disable_servo();
+    diag_all_low();
 }
 
 static void print_status() {
@@ -391,13 +677,19 @@ static void print_status() {
            MOTOR_QENC1_GPIO,
            current_led_char);
     print_pin_conflict_value();
+    printf(" DIAG_HIGH=");
+    print_diag_gpio_list(diag_high);
+    printf(" DIAG_PWM=");
+    print_diag_gpio_list(diag_pwm);
     printf("\n");
 }
 
 static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
-           "motor commands\n");
+           "PIN_STATUS, GPIO_READ <gpio>, GPIO_HIGH <gpio>, GPIO_LOW <gpio>, "
+           "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
+           "DIAG_ALL_LOW, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
 }
 
@@ -446,6 +738,54 @@ static bool handle_text_command(char* line) {
     if (strcmp(command, "HELP") == 0) {
         print_help();
         fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "PIN_STATUS") == 0) {
+        print_pin_status();
+        fflush(stdout);
+        set_led_char('D');
+        return true;
+    }
+
+    if (strcmp(command, "GPIO_READ") == 0) {
+        handle_gpio_read(rest);
+        return true;
+    }
+
+    if (strcmp(command, "GPIO_HIGH") == 0) {
+        handle_gpio_high(rest);
+        return true;
+    }
+
+    if (strcmp(command, "GPIO_LOW") == 0) {
+        handle_gpio_low(rest);
+        return true;
+    }
+
+    if (strcmp(command, "GPIO_PULSE") == 0) {
+        handle_gpio_pulse(rest);
+        return true;
+    }
+
+    if (strcmp(command, "PWM_TEST") == 0) {
+        handle_pwm_test(rest);
+        return true;
+    }
+
+    if (strcmp(command, "PWM_OFF") == 0) {
+        handle_pwm_off(rest);
+        return true;
+    }
+
+    if (strcmp(command, "DIAG_ALL_LOW") == 0) {
+        if (!diag_runtime_available()) {
+            return true;
+        }
+        diag_all_low();
+        printf("OK DIAG_ALL_LOW\n");
+        fflush(stdout);
+        set_led_char('D');
         return true;
     }
 
