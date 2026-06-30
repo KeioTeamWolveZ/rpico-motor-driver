@@ -5,9 +5,28 @@
 #include "../lib/rpico-pwm/pwm.h"
 #include "../lib/rpico-servo/servo.h"
 #include "hardware/pio.h"
+#include "pico/error.h"
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
 // #include "encoder.pio.h"
+
+#ifdef PICO_DEFAULT_LED_PIN
+static const uint LED_PIN = PICO_DEFAULT_LED_PIN;
+#else
+// Pico SDK seeed_xiao_rp2350.h defines the XIAO RP2350 user LED as GPIO25.
+static const uint LED_PIN = 25;
+#endif
+
+// XIAO user LEDs are commonly active-low. Flip these two constants if the
+// mounted board lights the LED with a high output instead.
+static const bool LED_ON = false;
+static const bool LED_OFF = true;
+static const uint32_t MORSE_DOT_MS = 150;
+static const uint32_t MORSE_DASH_MS = 500;
+static const uint32_t MORSE_SYMBOL_GAP_MS = 150;
+static const uint32_t MORSE_CHAR_GAP_MS = 1000;
+static const uint32_t LOOP_ALIVE_SERVICE_US = 10000;
+static const uint64_t LOOP_ALIVE_REPEAT_US = 2000000;
 
 Pwm pwm[4] = {Pwm(6, 50000), Pwm(7, 50000), Pwm(2, 50000), Pwm(3, 50000)};
 Servo servo(0);
@@ -17,10 +36,121 @@ Motor motor[2] = {Motor(pwm[3], pwm[0], enc[0]), Motor(pwm[1], pwm[2], enc[1])};
 
 char buf[255];
 
+void led_write(bool on) {
+    gpio_put(LED_PIN, on ? LED_ON : LED_OFF);
+}
+
+void init_led() {
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    led_write(false);
+}
+
+void blink_dot() {
+    led_write(true);
+    sleep_ms(MORSE_DOT_MS);
+    led_write(false);
+}
+
+void blink_dash() {
+    led_write(true);
+    sleep_ms(MORSE_DASH_MS);
+    led_write(false);
+}
+
+void blink_morse(const char* pattern) {
+    for (int i = 0; pattern[i] != 0; ++i) {
+        if (pattern[i] == '.') {
+            blink_dot();
+        } else if (pattern[i] == '-') {
+            blink_dash();
+        }
+
+        if (pattern[i + 1] != 0) {
+            sleep_ms(MORSE_SYMBOL_GAP_MS);
+        }
+    }
+    sleep_ms(MORSE_CHAR_GAP_MS);
+}
+
+void blink_error_forever() {
+    while (true) {
+        blink_dot();
+        sleep_ms(MORSE_SYMBOL_GAP_MS);
+    }
+}
+
+uint32_t morse_symbol_on_ms(char symbol) {
+    return symbol == '-' ? MORSE_DASH_MS : MORSE_DOT_MS;
+}
+
+void service_loop_alive_led() {
+    static const char pattern[] = ".-..";
+    static bool enabled = false;
+    static bool initialized = false;
+    static bool active = false;
+    static bool symbol_on = false;
+    static int index = 0;
+    static uint64_t cycle_start_us = 0;
+    static uint64_t next_event_us = 0;
+
+    uint64_t now_us = time_us_64();
+    if (!initialized) {
+        initialized = true;
+        enabled = true;
+        cycle_start_us = now_us;
+        next_event_us = now_us;
+    }
+
+    if (!enabled || now_us < next_event_us) {
+        return;
+    }
+
+    if (!active) {
+        active = true;
+        symbol_on = true;
+        index = 0;
+        cycle_start_us = now_us;
+        led_write(true);
+        next_event_us = now_us + morse_symbol_on_ms(pattern[index]) * 1000;
+        return;
+    }
+
+    if (symbol_on) {
+        led_write(false);
+        symbol_on = false;
+        if (pattern[index + 1] == 0) {
+            next_event_us = now_us + MORSE_CHAR_GAP_MS * 1000;
+        } else {
+            next_event_us = now_us + MORSE_SYMBOL_GAP_MS * 1000;
+        }
+        return;
+    }
+
+    if (pattern[index + 1] == 0) {
+        active = false;
+        index = 0;
+        uint64_t next_cycle_us = cycle_start_us + LOOP_ALIVE_REPEAT_US;
+        next_event_us = now_us < next_cycle_us ? next_cycle_us : now_us;
+        return;
+    }
+
+    ++index;
+    symbol_on = true;
+    led_write(true);
+    next_event_us = now_us + morse_symbol_on_ms(pattern[index]) * 1000;
+}
+
 bool readline(char* buf, int buf_size) {
     int i = 0;
     while (1) {
-        char c = getchar();
+        int c_raw = getchar_timeout_us(LOOP_ALIVE_SERVICE_US);
+        service_loop_alive_led();
+        if (c_raw == PICO_ERROR_TIMEOUT) {
+            continue;
+        }
+
+        char c = (char)c_raw;
         if (c == '\n') {
             break;
         }
@@ -30,7 +160,12 @@ bool readline(char* buf, int buf_size) {
         if (i >= buf_size - 1) {
             buf[buf_size - 1] = 0;
             while (c != '\n') {
-                c = getchar();
+                c_raw = getchar_timeout_us(LOOP_ALIVE_SERVICE_US);
+                service_loop_alive_led();
+                if (c_raw == PICO_ERROR_TIMEOUT) {
+                    continue;
+                }
+                c = (char)c_raw;
             }
             return false;
         }
@@ -79,11 +214,20 @@ void setup() {
 }
 
 int main() {
+    init_led();
+    // These diagnostic delays run before motor setup so the old motor/servo
+    // initialization order stays intact while boot progress is visible.
+    blink_morse("-...");
+    blink_morse("..-");
     stdio_init_all();
+    blink_morse("---");
     printf("DBG boot\n");
+    blink_morse("--");
     setup();
+    blink_morse("...");
     printf("DBG loop start\n");
     while (true) {
+        service_loop_alive_led();
         if (!readline(buf, sizeof(buf))) {
             printf("ERR line_too_long\n");
             continue;
