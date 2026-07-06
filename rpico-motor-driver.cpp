@@ -38,7 +38,7 @@
 #endif
 
 #ifndef MOTOR_SERVO_GPIO
-#define MOTOR_SERVO_GPIO 18
+#define MOTOR_SERVO_GPIO 5
 #endif
 
 #ifndef MOTOR_PWM0_GPIO
