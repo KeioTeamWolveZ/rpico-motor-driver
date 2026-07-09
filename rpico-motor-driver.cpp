@@ -722,13 +722,26 @@ static void print_status() {
     printf("\n");
 }
 
+static void print_encoder_status() {
+    if (!motors_runtime_enabled) {
+        printf("ERR MOTORS_DISABLED\n");
+        fflush(stdout);
+        return;
+    }
+
+    // Physical left/right mapping is provisional: enc[0]=left, enc[1]=right.
+    printf("ENCODER left=%d right=%d\n", enc[0].get(), enc[1].get());
+    fflush(stdout);
+}
+
 static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
            "PIN_STATUS, GPIO_READ <gpio>, GPIO_HIGH <gpio>, GPIO_LOW <gpio>, "
            "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
-           "DIAG_ALL_LOW, motor commands\n");
+           "DIAG_ALL_LOW, ENCODER, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
+    printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
 }
 
 static bool handle_text_command(char* line) {
@@ -783,6 +796,17 @@ static bool handle_text_command(char* line) {
         print_pin_status();
         fflush(stdout);
         set_led_char('D');
+        return true;
+    }
+
+    if (strcmp(command, "ENCODER") == 0) {
+        if (*skip_spaces(rest) != 0) {
+            printf("ERR ENCODER_ARGS\n");
+            fflush(stdout);
+            set_led_char('E');
+            return true;
+        }
+        print_encoder_status();
         return true;
     }
 
