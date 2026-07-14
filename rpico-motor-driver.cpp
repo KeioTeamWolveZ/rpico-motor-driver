@@ -576,9 +576,11 @@ static double encoder_count_to_deg(int count) {
     return (double)count * 360.0 / ENCODER_COUNTS_PER_REV;
 }
 
+// Sync API names are physical wheels: left=motor1/enc[1], right=motor0/enc[0].
+// Direction +/- is physical wheel rotation; + means CCW viewed from rover side.
 static void get_sync_encoder_counts(int* raw_l, int* raw_r, int* dl, int* dr) {
-    *raw_l = enc[0].get();
-    *raw_r = enc[1].get();
+    *raw_l = enc[1].get();
+    *raw_r = enc[0].get();
     *dl = *raw_l - sync_state.left_start_count;
     *dr = *raw_r - sync_state.right_start_count;
 }
@@ -604,12 +606,14 @@ static void sync_update() {
         return;
     }
 
-    int left_delta_count = enc[0].get() - sync_state.left_start_count;
-    int right_delta_count = enc[1].get() - sync_state.right_start_count;
+    int left_delta_count = enc[1].get() - sync_state.left_start_count;
+    int right_delta_count = enc[0].get() - sync_state.right_start_count;
+    // Existing position control uses internal motor sign = -physical sign.
+    // Apply the same convention so commanded physical motion increases progress.
     double left_progress_deg =
-        sync_state.left_dir_sign * encoder_count_to_deg(left_delta_count);
+        -sync_state.left_dir_sign * encoder_count_to_deg(left_delta_count);
     double right_progress_deg =
-        sync_state.right_dir_sign * encoder_count_to_deg(right_delta_count);
+        -sync_state.right_dir_sign * encoder_count_to_deg(right_delta_count);
     double error_deg = left_progress_deg - right_progress_deg;
 
     sync_state.last_left_progress_deg = left_progress_deg;
@@ -649,13 +653,15 @@ static void sync_update() {
         clamp_double(base_speed_abs - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
     double right_speed_abs =
         clamp_double(base_speed_abs + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
-    double left_cmd = sync_state.left_dir_sign * left_speed_abs;
-    double right_cmd = sync_state.right_dir_sign * right_speed_abs;
+    double left_physical_speed = sync_state.left_dir_sign * left_speed_abs;
+    double right_physical_speed = sync_state.right_dir_sign * right_speed_abs;
+    double left_internal_cmd = -left_physical_speed;
+    double right_internal_cmd = -right_physical_speed;
 
-    sync_state.last_left_speed_cmd_deg_s = left_cmd;
-    sync_state.last_right_speed_cmd_deg_s = right_cmd;
-    motor0->setVel((float)left_cmd);
-    motor1->setVel((float)right_cmd);
+    sync_state.last_left_speed_cmd_deg_s = left_physical_speed;
+    sync_state.last_right_speed_cmd_deg_s = right_physical_speed;
+    motor1->setVel((float)left_internal_cmd);
+    motor0->setVel((float)right_internal_cmd);
 }
 
 static void print_sync_status() {
@@ -785,8 +791,8 @@ static void handle_motors_sync_rot(char* rest) {
     sync_state.active = true;
     sync_state.done = false;
     sync_state.ever_started = true;
-    sync_state.left_start_count = enc[0].get();
-    sync_state.right_start_count = enc[1].get();
+    sync_state.left_start_count = enc[1].get();
+    sync_state.right_start_count = enc[0].get();
     sync_state.target_abs_deg = abs_deg;
     sync_state.left_dir_sign = left_dir_sign;
     sync_state.right_dir_sign = right_dir_sign;
@@ -1133,6 +1139,8 @@ static void print_help() {
            "DIAG_ALL_LOW, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
     printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
+    printf("MOTORS_SYNC_ROT: left/right are physical wheels; "
+           "left=motor1/enc1 right=motor0/enc0; + is CCW from rover side\n");
 }
 
 static bool handle_text_command(char* line) {
