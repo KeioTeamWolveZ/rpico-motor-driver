@@ -39,7 +39,7 @@
 #endif
 
 #ifndef MOTOR_SERVO_GPIO
-#define MOTOR_SERVO_GPIO 18
+#define MOTOR_SERVO_GPIO 5
 #endif
 
 #ifndef MOTOR_PWM0_GPIO
@@ -59,11 +59,11 @@
 #endif
 
 #ifndef MOTOR_QENC0_GPIO
-#define MOTOR_QENC0_GPIO 26
+#define MOTOR_QENC0_GPIO 6
 #endif
 
 #ifndef MOTOR_QENC1_GPIO
-#define MOTOR_QENC1_GPIO 28
+#define MOTOR_QENC1_GPIO 3
 #endif
 
 #if MOTOR_UART_ID == 0
