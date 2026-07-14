@@ -149,6 +149,37 @@ static bool diag_pwm[DIAG_MAX_GPIO + 1] = {false};
 
 static bool set_led_char(char led_char);
 
+static void force_motor_gpio_low(uint gpio) {
+    gpio_init(gpio);
+    gpio_set_function(gpio, GPIO_FUNC_SIO);
+    gpio_set_dir(gpio, GPIO_OUT);
+    gpio_put(gpio, 0);
+}
+
+static void force_motor_outputs_low() {
+    force_motor_gpio_low(MOTOR_PWM0_GPIO);
+    force_motor_gpio_low(MOTOR_PWM1_GPIO);
+    force_motor_gpio_low(MOTOR_PWM2_GPIO);
+    force_motor_gpio_low(MOTOR_PWM3_GPIO);
+}
+
+static void restore_motor_pwm_gpio(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    uint channel = pwm_gpio_to_channel(gpio);
+    pwm_set_clkdiv(slice, (float)125E6 / (2048 * DIAG_PWM_FREQ));
+    pwm_set_wrap(slice, 2047);
+    pwm_set_chan_level(slice, channel, 0);
+    pwm_set_enabled(slice, true);
+}
+
+static void restore_motor_pwm_outputs() {
+    restore_motor_pwm_gpio(MOTOR_PWM0_GPIO);
+    restore_motor_pwm_gpio(MOTOR_PWM1_GPIO);
+    restore_motor_pwm_gpio(MOTOR_PWM2_GPIO);
+    restore_motor_pwm_gpio(MOTOR_PWM3_GPIO);
+}
+
 static bool pin_is_uart(int pin) {
     return pin == MOTOR_UART_TX_GPIO || pin == MOTOR_UART_RX_GPIO;
 }
@@ -527,6 +558,9 @@ static void sync_cancel(bool stop_motors) {
         motor[0].setVel(0);
         motor[1].setVel(0);
     }
+    if (stop_motors) {
+        force_motor_outputs_low();
+    }
 }
 
 static void sync_update() {
@@ -639,6 +673,7 @@ static void print_sync_status() {
 
 static void handle_encoder() {
     if (!motors_runtime_enabled) {
+        force_motor_outputs_low();
         printf("ERR MOTORS_DISABLED\n");
         fflush(stdout);
         set_led_char('E');
@@ -659,24 +694,28 @@ static void handle_motors_sync_rot(char* rest) {
     int right_dir_sign = 0;
     if (sscanf(rest, "%lf %15s %15s %lf",
                &abs_deg, left_dir_token, right_dir_token, &speed_deg_s) != 4) {
+        force_motor_outputs_low();
         printf("ERR INVALID_SYNC_TARGET\n");
         fflush(stdout);
         set_led_char('E');
         return;
     }
     if (!motors_runtime_enabled) {
+        force_motor_outputs_low();
         printf("ERR MOTORS_DISABLED\n");
         fflush(stdout);
         set_led_char('E');
         return;
     }
     if (abs_deg <= 0.0) {
+        force_motor_outputs_low();
         printf("ERR INVALID_SYNC_TARGET\n");
         fflush(stdout);
         set_led_char('E');
         return;
     }
     if (speed_deg_s <= 0.0) {
+        force_motor_outputs_low();
         printf("ERR INVALID_SYNC_SPEED\n");
         fflush(stdout);
         set_led_char('E');
@@ -684,6 +723,7 @@ static void handle_motors_sync_rot(char* rest) {
     }
     if (!parse_sync_dir(left_dir_token, &left_dir_sign) ||
         !parse_sync_dir(right_dir_token, &right_dir_sign)) {
+        force_motor_outputs_low();
         printf("ERR INVALID_SYNC_DIR\n");
         fflush(stdout);
         set_led_char('E');
@@ -698,6 +738,7 @@ static void handle_motors_sync_rot(char* rest) {
 
     motor[0].disablePosPid();
     motor[1].disablePosPid();
+    restore_motor_pwm_outputs();
     sync_state.active = true;
     sync_state.done = false;
     sync_state.ever_started = true;
@@ -922,6 +963,7 @@ static void stop_motor_timers() {
 
 static void stop_motors_if_enabled() {
     if (!motors_initialized) {
+        force_motor_outputs_low();
         return;
     }
     sync_cancel(false);
@@ -929,6 +971,7 @@ static void stop_motors_if_enabled() {
     motor[1].disablePosPid();
     motor[0].setVel(0);
     motor[1].setVel(0);
+    force_motor_outputs_low();
 }
 
 static void configure_motor_gains() {
@@ -939,7 +982,9 @@ static void configure_motor_gains() {
 }
 
 static bool enable_motors() {
+    force_motor_outputs_low();
     if (motors_pin_conflict()) {
+        force_motor_outputs_low();
         return false;
     }
 
@@ -952,11 +997,16 @@ static bool enable_motors() {
         motor[1].init();
         configure_motor_gains();
         motors_initialized = true;
+    } else {
+        configure_motor_gains();
     }
 
     motors_runtime_enabled = true;
     stop_motors_if_enabled();
+    motor[0].setVel(0);
+    motor[1].setVel(0);
     start_motor_timers();
+    force_motor_outputs_low();
     return true;
 }
 
@@ -965,6 +1015,7 @@ static void disable_motors() {
     stop_motors_if_enabled();
     motors_runtime_enabled = false;
     stop_motor_timers();
+    force_motor_outputs_low();
 }
 
 static bool enable_servo() {
@@ -984,9 +1035,14 @@ static void disable_servo() {
 }
 
 static void safe_all() {
+    sync_cancel(true);
+    stop_motors_if_enabled();
+    motors_runtime_enabled = false;
+    force_motor_outputs_low();
     disable_motors();
     disable_servo();
     diag_all_low();
+    force_motor_outputs_low();
 }
 
 static void print_status() {
@@ -1244,6 +1300,7 @@ static bool readline(char* line, int line_size) {
 }
 
 int main() {
+    force_motor_outputs_low();
     init_led();
     init_uart_stdio();
     set_led_char('L');
@@ -1253,6 +1310,7 @@ int main() {
     while (true) {
         service_led();
         if (!readline(buf, sizeof(buf))) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR line_too_long\n");
             fflush(stdout);
@@ -1272,6 +1330,7 @@ int main() {
         printf("DBG parse n=%d id=%d mode=%d val=%.3f\n", parsed, id, mode, val);
         fflush(stdout);
         if (parsed != 3) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR parse raw=\"%s\"\n", buf);
             fflush(stdout);
@@ -1282,18 +1341,21 @@ int main() {
         fflush(stdout);
 
         if (id < 0 || id > 2) {
+            force_motor_outputs_low();
             set_led_char('I');
             printf("ERR id out_of_range id=%d\n", id);
             fflush(stdout);
             continue;
         }
         if ((id == 0 || id == 1) && !motors_runtime_enabled) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR MOTORS_DISABLED\n");
             fflush(stdout);
             continue;
         }
         if ((id == 0 || id == 1) && sync_state.active) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR SYNC_BUSY\n");
             fflush(stdout);
@@ -1306,6 +1368,7 @@ int main() {
             continue;
         }
         if ((id == 0 || id == 1) && mode != 0 && mode != 1) {
+            force_motor_outputs_low();
             set_led_char('I');
             printf("ERR mode invalid id=%d mode=%d\n", id, mode);
             fflush(stdout);
@@ -1314,6 +1377,7 @@ int main() {
 
         switch (id) {
             case 0:
+                restore_motor_pwm_outputs();
                 if (!mode) {
                     motor[0].disablePosPid();
                     motor[0].setVel(val);
@@ -1325,6 +1389,7 @@ int main() {
                 }
                 break;
             case 1:
+                restore_motor_pwm_outputs();
                 if (!mode) {
                     motor[1].disablePosPid();
                     motor[1].setVel(val);
