@@ -713,20 +713,6 @@ static void print_sync_status() {
     printf("SYNC_STATUS state=IDLE\n");
 }
 
-static void handle_encoder() {
-    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
-        force_motor_outputs_low();
-        printf("ERR MOTORS_DISABLED\n");
-        fflush(stdout);
-        set_led_char('E');
-        return;
-    }
-
-    printf("ENCODER left=%d right=%d\n", enc[0].get(), enc[1].get());
-    fflush(stdout);
-    set_led_char('D');
-}
-
 static void handle_motors_sync_rot(char* rest) {
     double abs_deg = 0.0;
     double speed_deg_s = 0.0;
@@ -1129,6 +1115,18 @@ static void print_status() {
     printf("\n");
 }
 
+static void print_encoder_status() {
+    if (!motors_runtime_enabled) {
+        printf("ERR MOTORS_DISABLED\n");
+        fflush(stdout);
+        return;
+    }
+
+    // Physical left/right mapping is provisional: enc[0]=left, enc[1]=right.
+    printf("ENCODER left=%d right=%d\n", enc[0].get(), enc[1].get());
+    fflush(stdout);
+}
+
 static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
@@ -1138,6 +1136,7 @@ static void print_help() {
            "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
            "DIAG_ALL_LOW, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
+    printf("SERVO: 2 <mode> <angle_deg>\n");
     printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
     printf("MOTORS_SYNC_ROT: left/right are physical wheels; "
            "left=motor1/enc1 right=motor0/enc0; + is CCW from rover side\n");
@@ -1198,6 +1197,17 @@ static bool handle_text_command(char* line) {
         return true;
     }
 
+    if (strcmp(command, "ENCODER") == 0) {
+        if (*skip_spaces(rest) != 0) {
+            printf("ERR ENCODER_ARGS\n");
+            fflush(stdout);
+            set_led_char('E');
+            return true;
+        }
+        print_encoder_status();
+        return true;
+    }
+
     if (strcmp(command, "GPIO_READ") == 0) {
         handle_gpio_read(rest);
         return true;
@@ -1236,11 +1246,6 @@ static bool handle_text_command(char* line) {
         printf("OK DIAG_ALL_LOW\n");
         fflush(stdout);
         set_led_char('D');
-        return true;
-    }
-
-    if (strcmp(command, "ENCODER") == 0) {
-        handle_encoder();
         return true;
     }
 
