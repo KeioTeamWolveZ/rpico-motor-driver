@@ -510,6 +510,13 @@ static double encoder_count_to_deg(int count) {
     return (double)count * 360.0 / ENCODER_COUNTS_PER_REV;
 }
 
+static void get_sync_encoder_counts(int* raw_l, int* raw_r, int* dl, int* dr) {
+    *raw_l = enc[0].get();
+    *raw_r = enc[1].get();
+    *dl = *raw_l - sync_state.left_start_count;
+    *dr = *raw_r - sync_state.right_start_count;
+}
+
 static void sync_cancel(bool stop_motors) {
     sync_state.active = false;
     sync_state.done = false;
@@ -583,25 +590,64 @@ static void sync_update() {
 
 static void print_sync_status() {
     if (sync_state.active) {
+        sync_update();
+    }
+
+    int raw_l = 0;
+    int raw_r = 0;
+    int dl = 0;
+    int dr = 0;
+    bool have_encoder_counts = motors_initialized;
+    if (have_encoder_counts) {
+        get_sync_encoder_counts(&raw_l, &raw_r, &dl, &dr);
+    }
+
+    if (sync_state.active) {
         printf("SYNC_STATUS state=BUSY target=%.3f left=%.3f right=%.3f "
-               "error=%.3f speed_l=%.3f speed_r=%.3f\n",
+               "error=%.3f speed_l=%.3f speed_r=%.3f raw_l=%d raw_r=%d dl=%d dr=%d\n",
                sync_state.target_abs_deg,
                sync_state.last_left_progress_deg,
                sync_state.last_right_progress_deg,
                sync_state.last_error_deg,
                sync_state.last_left_speed_cmd_deg_s,
-               sync_state.last_right_speed_cmd_deg_s);
+               sync_state.last_right_speed_cmd_deg_s,
+               raw_l,
+               raw_r,
+               dl,
+               dr);
         return;
     }
     if (sync_state.done && sync_state.ever_started) {
-        printf("SYNC_STATUS state=DONE target=%.3f left=%.3f right=%.3f error=%.3f\n",
+        printf("SYNC_STATUS state=DONE target=%.3f left=%.3f right=%.3f "
+               "error=%.3f raw_l=%d raw_r=%d dl=%d dr=%d\n",
                sync_state.target_abs_deg,
                sync_state.final_left_progress_deg,
                sync_state.final_right_progress_deg,
-               sync_state.final_error_deg);
+               sync_state.final_error_deg,
+               raw_l,
+               raw_r,
+               dl,
+               dr);
+        return;
+    }
+    if (have_encoder_counts) {
+        printf("SYNC_STATUS state=IDLE raw_l=%d raw_r=%d\n", raw_l, raw_r);
         return;
     }
     printf("SYNC_STATUS state=IDLE\n");
+}
+
+static void handle_encoder() {
+    if (!motors_runtime_enabled) {
+        printf("ERR MOTORS_DISABLED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+
+    printf("ENCODER left=%d right=%d\n", enc[0].get(), enc[1].get());
+    fflush(stdout);
+    set_led_char('D');
 }
 
 static void handle_motors_sync_rot(char* rest) {
@@ -974,11 +1020,12 @@ static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
            "MOTORS_SYNC_ROT <abs_deg> <left_dir> <right_dir> <speed_deg_s>, "
-           "MOTORS_SYNC_STATUS, MOTORS_SYNC_CANCEL, "
+           "MOTORS_SYNC_STATUS, MOTORS_SYNC_CANCEL, ENCODER, "
            "PIN_STATUS, GPIO_READ <gpio>, GPIO_HIGH <gpio>, GPIO_LOW <gpio>, "
            "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
            "DIAG_ALL_LOW, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
+    printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
 }
 
 static bool handle_text_command(char* line) {
@@ -1074,6 +1121,11 @@ static bool handle_text_command(char* line) {
         printf("OK DIAG_ALL_LOW\n");
         fflush(stdout);
         set_led_char('D');
+        return true;
+    }
+
+    if (strcmp(command, "ENCODER") == 0) {
+        handle_encoder();
         return true;
     }
 
