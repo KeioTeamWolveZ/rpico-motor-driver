@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <new>
 #include <stdio.h>
 #include <string.h>
 
@@ -118,15 +119,14 @@ struct SyncRotationState {
     double final_error_deg;
 };
 
-Pwm pwm[4] = {
-    Pwm(MOTOR_PWM0_GPIO, 50000),
-    Pwm(MOTOR_PWM1_GPIO, 50000),
-    Pwm(MOTOR_PWM2_GPIO, 50000),
-    Pwm(MOTOR_PWM3_GPIO, 50000),
-};
 Servo servo(MOTOR_SERVO_GPIO);
 Qenc enc[2] = {Qenc(MOTOR_QENC0_GPIO), Qenc(MOTOR_QENC1_GPIO)};
-Motor motor[2] = {Motor(pwm[3], pwm[0], enc[0]), Motor(pwm[1], pwm[2], enc[1])};
+static Pwm* pwm0 = NULL;
+static Pwm* pwm1 = NULL;
+static Pwm* pwm2 = NULL;
+static Pwm* pwm3 = NULL;
+static Motor* motor0 = NULL;
+static Motor* motor1 = NULL;
 
 static char buf[255];
 static char current_led_char = 'L';
@@ -178,6 +178,41 @@ static void restore_motor_pwm_outputs() {
     restore_motor_pwm_gpio(MOTOR_PWM1_GPIO);
     restore_motor_pwm_gpio(MOTOR_PWM2_GPIO);
     restore_motor_pwm_gpio(MOTOR_PWM3_GPIO);
+}
+
+static bool create_motor_objects_if_needed() {
+    if (pwm0 != NULL && pwm1 != NULL && pwm2 != NULL && pwm3 != NULL &&
+        motor0 != NULL && motor1 != NULL) {
+        return true;
+    }
+
+    if (pwm0 == NULL) {
+        pwm0 = new (std::nothrow) Pwm(MOTOR_PWM0_GPIO, 50000);
+    }
+    if (pwm1 == NULL) {
+        pwm1 = new (std::nothrow) Pwm(MOTOR_PWM1_GPIO, 50000);
+    }
+    if (pwm2 == NULL) {
+        pwm2 = new (std::nothrow) Pwm(MOTOR_PWM2_GPIO, 50000);
+    }
+    if (pwm3 == NULL) {
+        pwm3 = new (std::nothrow) Pwm(MOTOR_PWM3_GPIO, 50000);
+    }
+
+    if (pwm0 == NULL || pwm1 == NULL || pwm2 == NULL || pwm3 == NULL) {
+        force_motor_outputs_low();
+        return false;
+    }
+
+    if (motor0 == NULL) {
+        motor0 = new (std::nothrow) Motor(*pwm3, *pwm0, enc[0]);
+    }
+    if (motor1 == NULL) {
+        motor1 = new (std::nothrow) Motor(*pwm1, *pwm2, enc[1]);
+    }
+
+    force_motor_outputs_low();
+    return motor0 != NULL && motor1 != NULL;
 }
 
 static bool pin_is_uart(int pin) {
@@ -554,9 +589,9 @@ static void sync_cancel(bool stop_motors) {
     sync_state.ever_started = false;
     sync_state.last_left_speed_cmd_deg_s = 0.0;
     sync_state.last_right_speed_cmd_deg_s = 0.0;
-    if (stop_motors && motors_initialized) {
-        motor[0].setVel(0);
-        motor[1].setVel(0);
+    if (stop_motors && motors_initialized && motor0 != NULL && motor1 != NULL) {
+        motor0->setVel(0);
+        motor1->setVel(0);
     }
     if (stop_motors) {
         force_motor_outputs_low();
@@ -564,7 +599,8 @@ static void sync_cancel(bool stop_motors) {
 }
 
 static void sync_update() {
-    if (!sync_state.active || !motors_runtime_enabled) {
+    if (!sync_state.active || !motors_runtime_enabled || !motors_initialized ||
+        motor0 == NULL || motor1 == NULL) {
         return;
     }
 
@@ -582,8 +618,8 @@ static void sync_update() {
 
     if (left_progress_deg >= sync_state.target_abs_deg - SYNC_TOLERANCE_DEG &&
         right_progress_deg >= sync_state.target_abs_deg - SYNC_TOLERANCE_DEG) {
-        motor[0].setVel(0);
-        motor[1].setVel(0);
+        motor0->setVel(0);
+        motor1->setVel(0);
         sync_state.last_left_speed_cmd_deg_s = 0.0;
         sync_state.last_right_speed_cmd_deg_s = 0.0;
         sync_state.final_left_progress_deg = left_progress_deg;
@@ -618,8 +654,8 @@ static void sync_update() {
 
     sync_state.last_left_speed_cmd_deg_s = left_cmd;
     sync_state.last_right_speed_cmd_deg_s = right_cmd;
-    motor[0].setVel((float)left_cmd);
-    motor[1].setVel((float)right_cmd);
+    motor0->setVel((float)left_cmd);
+    motor1->setVel((float)right_cmd);
 }
 
 static void print_sync_status() {
@@ -672,7 +708,7 @@ static void print_sync_status() {
 }
 
 static void handle_encoder() {
-    if (!motors_runtime_enabled) {
+    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
         force_motor_outputs_low();
         printf("ERR MOTORS_DISABLED\n");
         fflush(stdout);
@@ -729,6 +765,13 @@ static void handle_motors_sync_rot(char* rest) {
         set_led_char('E');
         return;
     }
+    if (!motors_initialized || motor0 == NULL || motor1 == NULL) {
+        force_motor_outputs_low();
+        printf("ERR MOTORS_DISABLED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
     if (sync_state.active) {
         printf("ERR SYNC_BUSY\n");
         fflush(stdout);
@@ -736,8 +779,8 @@ static void handle_motors_sync_rot(char* rest) {
         return;
     }
 
-    motor[0].disablePosPid();
-    motor[1].disablePosPid();
+    motor0->disablePosPid();
+    motor1->disablePosPid();
     restore_motor_pwm_outputs();
     sync_state.active = true;
     sync_state.done = false;
@@ -925,21 +968,21 @@ static void handle_pwm_off(char* rest) {
 }
 
 static bool timer_cb(repeating_timer_t* rt) {
-    if (!motors_runtime_enabled) {
+    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
         return timer_started;
     }
     sync_update();
-    motor[0].timer_cb();
-    motor[1].timer_cb();
+    motor0->timer_cb();
+    motor1->timer_cb();
     return timer_started;
 }
 
 static bool timer_cb_pos(repeating_timer_t* rt) {
-    if (!motors_runtime_enabled) {
+    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
         return timer_started;
     }
-    motor[0].timer_cb_pos();
-    motor[1].timer_cb_pos();
+    motor0->timer_cb_pos();
+    motor1->timer_cb_pos();
     return timer_started;
 }
 
@@ -962,23 +1005,26 @@ static void stop_motor_timers() {
 }
 
 static void stop_motors_if_enabled() {
-    if (!motors_initialized) {
+    if (!motors_initialized || motor0 == NULL || motor1 == NULL) {
         force_motor_outputs_low();
         return;
     }
     sync_cancel(false);
-    motor[0].disablePosPid();
-    motor[1].disablePosPid();
-    motor[0].setVel(0);
-    motor[1].setVel(0);
+    motor0->disablePosPid();
+    motor1->disablePosPid();
+    motor0->setVel(0);
+    motor1->setVel(0);
     force_motor_outputs_low();
 }
 
 static void configure_motor_gains() {
-    motor[0].setVelGain(1, 0.0, 0.09);
-    motor[0].setPosGain(2.5, 0.0, 0.09);
-    motor[1].setVelGain(1, 0.0, 0.09);
-    motor[1].setPosGain(2.5, 0.0, 0.09);
+    if (motor0 == NULL || motor1 == NULL) {
+        return;
+    }
+    motor0->setVelGain(1, 0.0, 0.09);
+    motor0->setPosGain(2.5, 0.0, 0.09);
+    motor1->setVelGain(1, 0.0, 0.09);
+    motor1->setPosGain(2.5, 0.0, 0.09);
 }
 
 static bool enable_motors() {
@@ -987,14 +1033,19 @@ static bool enable_motors() {
         force_motor_outputs_low();
         return false;
     }
+    if (!create_motor_objects_if_needed()) {
+        force_motor_outputs_low();
+        return false;
+    }
+    force_motor_outputs_low();
 
     if (!motors_initialized) {
         gpio_set_dir(MOTOR_QENC0_GPIO, GPIO_IN);
         gpio_set_dir(MOTOR_QENC0_GPIO + 1, GPIO_IN);
         gpio_set_dir(MOTOR_QENC1_GPIO, GPIO_IN);
         gpio_set_dir(MOTOR_QENC1_GPIO + 1, GPIO_IN);
-        motor[0].init();
-        motor[1].init();
+        motor0->init();
+        motor1->init();
         configure_motor_gains();
         motors_initialized = true;
     } else {
@@ -1003,8 +1054,8 @@ static bool enable_motors() {
 
     motors_runtime_enabled = true;
     stop_motors_if_enabled();
-    motor[0].setVel(0);
-    motor[1].setVel(0);
+    motor0->setVel(0);
+    motor1->setVel(0);
     start_motor_timers();
     force_motor_outputs_low();
     return true;
@@ -1347,7 +1398,9 @@ int main() {
             fflush(stdout);
             continue;
         }
-        if ((id == 0 || id == 1) && !motors_runtime_enabled) {
+        if ((id == 0 || id == 1) &&
+            (!motors_runtime_enabled || !motors_initialized ||
+             motor0 == NULL || motor1 == NULL)) {
             force_motor_outputs_low();
             set_led_char('E');
             printf("ERR MOTORS_DISABLED\n");
@@ -1379,24 +1432,24 @@ int main() {
             case 0:
                 restore_motor_pwm_outputs();
                 if (!mode) {
-                    motor[0].disablePosPid();
-                    motor[0].setVel(val);
+                    motor0->disablePosPid();
+                    motor0->setVel(val);
                     printf("OK motor id=0 mode=vel target=%.3f\n", val);
                 } else {
-                    motor[0].resetPos();
-                    motor[0].setPos(val);
+                    motor0->resetPos();
+                    motor0->setPos(val);
                     printf("OK motor id=0 mode=pos target=%.3f\n", val);
                 }
                 break;
             case 1:
                 restore_motor_pwm_outputs();
                 if (!mode) {
-                    motor[1].disablePosPid();
-                    motor[1].setVel(val);
+                    motor1->disablePosPid();
+                    motor1->setVel(val);
                     printf("OK motor id=1 mode=vel target=%.3f\n", val);
                 } else {
-                    motor[1].resetPos();
-                    motor[1].setPos(val);
+                    motor1->resetPos();
+                    motor1->setPos(val);
                     printf("OK motor id=1 mode=pos target=%.3f\n", val);
                 }
                 break;
