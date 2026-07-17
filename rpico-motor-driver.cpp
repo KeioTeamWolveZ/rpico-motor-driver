@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <new>
 #include <stdio.h>
 #include <string.h>
 
@@ -58,11 +59,11 @@
 #endif
 
 #ifndef MOTOR_QENC0_GPIO
-#define MOTOR_QENC0_GPIO 26
+#define MOTOR_QENC0_GPIO 6
 #endif
 
 #ifndef MOTOR_QENC1_GPIO
-#define MOTOR_QENC1_GPIO 28
+#define MOTOR_QENC1_GPIO 3
 #endif
 
 #if MOTOR_UART_ID == 0
@@ -90,16 +91,42 @@ static const uint32_t MORSE_CHAR_GAP_MS = 1000;
 static const uint32_t LOOP_ALIVE_SERVICE_US = 10000;
 static const int DIAG_MAX_GPIO = 29;
 static const int DIAG_PWM_FREQ = 50000;
+static const double ENCODER_COUNTS_PER_REV = 3900.0;
+static const double SYNC_KP = 0.30;
+static const double SYNC_KD = 0.00;
+static const double SYNC_TOLERANCE_DEG = 3.0;
+static const double SYNC_MIN_SPEED_DEG_S = 20.0;
+static const double SYNC_MAX_SPEED_DEG_S = 180.0;
+static const double SYNC_SLOWDOWN_GAIN = 1.2;
 
-Pwm pwm[4] = {
-    Pwm(MOTOR_PWM0_GPIO, 50000),
-    Pwm(MOTOR_PWM1_GPIO, 50000),
-    Pwm(MOTOR_PWM2_GPIO, 50000),
-    Pwm(MOTOR_PWM3_GPIO, 50000),
+struct SyncRotationState {
+    bool active;
+    bool done;
+    bool ever_started;
+    int left_start_count;
+    int right_start_count;
+    double target_abs_deg;
+    int left_dir_sign;
+    int right_dir_sign;
+    double base_speed_deg_s;
+    double last_left_progress_deg;
+    double last_right_progress_deg;
+    double last_error_deg;
+    double last_left_speed_cmd_deg_s;
+    double last_right_speed_cmd_deg_s;
+    double final_left_progress_deg;
+    double final_right_progress_deg;
+    double final_error_deg;
 };
+
 Servo servo(MOTOR_SERVO_GPIO);
 Qenc enc[2] = {Qenc(MOTOR_QENC0_GPIO), Qenc(MOTOR_QENC1_GPIO)};
-Motor motor[2] = {Motor(pwm[3], pwm[0], enc[0]), Motor(pwm[1], pwm[2], enc[1])};
+static Pwm* pwm0 = NULL;
+static Pwm* pwm1 = NULL;
+static Pwm* pwm2 = NULL;
+static Pwm* pwm3 = NULL;
+static Motor* motor0 = NULL;
+static Motor* motor1 = NULL;
 
 static char buf[255];
 static char current_led_char = 'L';
@@ -114,12 +141,79 @@ static bool motors_initialized = false;
 static bool servo_runtime_enabled = false;
 static bool servo_initialized = false;
 static bool timer_started = false;
+static SyncRotationState sync_state = {};
 static repeating_timer_t velocity_timer;
 static repeating_timer_t position_timer;
 static bool diag_high[DIAG_MAX_GPIO + 1] = {false};
 static bool diag_pwm[DIAG_MAX_GPIO + 1] = {false};
 
 static bool set_led_char(char led_char);
+
+static void force_motor_gpio_low(uint gpio) {
+    gpio_init(gpio);
+    gpio_set_function(gpio, GPIO_FUNC_SIO);
+    gpio_set_dir(gpio, GPIO_OUT);
+    gpio_put(gpio, 0);
+}
+
+static void force_motor_outputs_low() {
+    force_motor_gpio_low(MOTOR_PWM0_GPIO);
+    force_motor_gpio_low(MOTOR_PWM1_GPIO);
+    force_motor_gpio_low(MOTOR_PWM2_GPIO);
+    force_motor_gpio_low(MOTOR_PWM3_GPIO);
+}
+
+static void restore_motor_pwm_gpio(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    uint channel = pwm_gpio_to_channel(gpio);
+    pwm_set_clkdiv(slice, (float)125E6 / (2048 * DIAG_PWM_FREQ));
+    pwm_set_wrap(slice, 2047);
+    pwm_set_chan_level(slice, channel, 0);
+    pwm_set_enabled(slice, true);
+}
+
+static void restore_motor_pwm_outputs() {
+    restore_motor_pwm_gpio(MOTOR_PWM0_GPIO);
+    restore_motor_pwm_gpio(MOTOR_PWM1_GPIO);
+    restore_motor_pwm_gpio(MOTOR_PWM2_GPIO);
+    restore_motor_pwm_gpio(MOTOR_PWM3_GPIO);
+}
+
+static bool create_motor_objects_if_needed() {
+    if (pwm0 != NULL && pwm1 != NULL && pwm2 != NULL && pwm3 != NULL &&
+        motor0 != NULL && motor1 != NULL) {
+        return true;
+    }
+
+    if (pwm0 == NULL) {
+        pwm0 = new (std::nothrow) Pwm(MOTOR_PWM0_GPIO, 50000);
+    }
+    if (pwm1 == NULL) {
+        pwm1 = new (std::nothrow) Pwm(MOTOR_PWM1_GPIO, 50000);
+    }
+    if (pwm2 == NULL) {
+        pwm2 = new (std::nothrow) Pwm(MOTOR_PWM2_GPIO, 50000);
+    }
+    if (pwm3 == NULL) {
+        pwm3 = new (std::nothrow) Pwm(MOTOR_PWM3_GPIO, 50000);
+    }
+
+    if (pwm0 == NULL || pwm1 == NULL || pwm2 == NULL || pwm3 == NULL) {
+        force_motor_outputs_low();
+        return false;
+    }
+
+    if (motor0 == NULL) {
+        motor0 = new (std::nothrow) Motor(*pwm3, *pwm0, enc[0]);
+    }
+    if (motor1 == NULL) {
+        motor1 = new (std::nothrow) Motor(*pwm1, *pwm2, enc[1]);
+    }
+
+    force_motor_outputs_low();
+    return motor0 != NULL && motor1 != NULL;
+}
 
 static bool pin_is_uart(int pin) {
     return pin == MOTOR_UART_TX_GPIO || pin == MOTOR_UART_RX_GPIO;
@@ -435,6 +529,279 @@ static bool parse_three_ints(char* text, int* a, int* b, int* c) {
     return sscanf(text, "%d %d %d", a, b, c) == 3;
 }
 
+static double clamp_double(double value, double min_value, double max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static double min_double(double a, double b) {
+    return a < b ? a : b;
+}
+
+static bool token_equals_ignore_case(const char* a, const char* b) {
+    while (*a != 0 && *b != 0) {
+        if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static bool parse_sync_dir(const char* token, int* dir_sign) {
+    if (strcmp(token, "+") == 0 || strcmp(token, "1") == 0 ||
+        token_equals_ignore_case(token, "PLUS")) {
+        *dir_sign = 1;
+        return true;
+    }
+    if (strcmp(token, "-") == 0 || strcmp(token, "-1") == 0 ||
+        token_equals_ignore_case(token, "MINUS")) {
+        *dir_sign = -1;
+        return true;
+    }
+    return false;
+}
+
+static char sync_dir_char(int dir_sign) {
+    return dir_sign >= 0 ? '+' : '-';
+}
+
+static double encoder_count_to_deg(int count) {
+    return (double)count * 360.0 / ENCODER_COUNTS_PER_REV;
+}
+
+// Sync API names are physical wheels: left=motor1/enc[1], right=motor0/enc[0].
+// Direction +/- is physical wheel rotation; + means CCW viewed from rover side.
+static void get_sync_encoder_counts(int* raw_l, int* raw_r, int* dl, int* dr) {
+    *raw_l = enc[1].get();
+    *raw_r = enc[0].get();
+    *dl = *raw_l - sync_state.left_start_count;
+    *dr = *raw_r - sync_state.right_start_count;
+}
+
+static void sync_cancel(bool stop_motors) {
+    sync_state.active = false;
+    sync_state.done = false;
+    sync_state.ever_started = false;
+    sync_state.last_left_speed_cmd_deg_s = 0.0;
+    sync_state.last_right_speed_cmd_deg_s = 0.0;
+    if (stop_motors && motors_initialized && motor0 != NULL && motor1 != NULL) {
+        motor0->setVel(0);
+        motor1->setVel(0);
+    }
+    if (stop_motors) {
+        force_motor_outputs_low();
+    }
+}
+
+static void sync_update() {
+    if (!sync_state.active || !motors_runtime_enabled || !motors_initialized ||
+        motor0 == NULL || motor1 == NULL) {
+        return;
+    }
+
+    int left_delta_count = enc[1].get() - sync_state.left_start_count;
+    int right_delta_count = enc[0].get() - sync_state.right_start_count;
+    // Existing position control uses internal motor sign = -physical sign.
+    // Apply the same convention so commanded physical motion increases progress.
+    double left_progress_deg =
+        -sync_state.left_dir_sign * encoder_count_to_deg(left_delta_count);
+    double right_progress_deg =
+        -sync_state.right_dir_sign * encoder_count_to_deg(right_delta_count);
+    double error_deg = left_progress_deg - right_progress_deg;
+
+    sync_state.last_left_progress_deg = left_progress_deg;
+    sync_state.last_right_progress_deg = right_progress_deg;
+    sync_state.last_error_deg = error_deg;
+
+    if (left_progress_deg >= sync_state.target_abs_deg - SYNC_TOLERANCE_DEG &&
+        right_progress_deg >= sync_state.target_abs_deg - SYNC_TOLERANCE_DEG) {
+        motor0->setVel(0);
+        motor1->setVel(0);
+        sync_state.last_left_speed_cmd_deg_s = 0.0;
+        sync_state.last_right_speed_cmd_deg_s = 0.0;
+        sync_state.final_left_progress_deg = left_progress_deg;
+        sync_state.final_right_progress_deg = right_progress_deg;
+        sync_state.final_error_deg = error_deg;
+        sync_state.active = false;
+        sync_state.done = true;
+        return;
+    }
+
+    double left_remaining = sync_state.target_abs_deg - left_progress_deg;
+    double right_remaining = sync_state.target_abs_deg - right_progress_deg;
+    double remaining_min = min_double(left_remaining, right_remaining);
+    double requested_speed =
+        clamp_double(sync_state.base_speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
+    double base_speed_abs =
+        min_double(requested_speed, SYNC_SLOWDOWN_GAIN * remaining_min);
+    if (base_speed_abs < 0.0) {
+        base_speed_abs = 0.0;
+    }
+    if (remaining_min > SYNC_TOLERANCE_DEG && base_speed_abs < SYNC_MIN_SPEED_DEG_S) {
+        base_speed_abs = SYNC_MIN_SPEED_DEG_S;
+    }
+
+    double correction = SYNC_KP * error_deg + SYNC_KD * 0.0;
+    double left_speed_abs =
+        clamp_double(base_speed_abs - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
+    double right_speed_abs =
+        clamp_double(base_speed_abs + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
+    double left_physical_speed = sync_state.left_dir_sign * left_speed_abs;
+    double right_physical_speed = sync_state.right_dir_sign * right_speed_abs;
+    double left_internal_cmd = -left_physical_speed;
+    double right_internal_cmd = -right_physical_speed;
+
+    sync_state.last_left_speed_cmd_deg_s = left_physical_speed;
+    sync_state.last_right_speed_cmd_deg_s = right_physical_speed;
+    motor1->setVel((float)left_internal_cmd);
+    motor0->setVel((float)right_internal_cmd);
+}
+
+static void print_sync_status() {
+    if (sync_state.active) {
+        sync_update();
+    }
+
+    int raw_l = 0;
+    int raw_r = 0;
+    int dl = 0;
+    int dr = 0;
+    bool have_encoder_counts = motors_initialized;
+    if (have_encoder_counts) {
+        get_sync_encoder_counts(&raw_l, &raw_r, &dl, &dr);
+    }
+
+    if (sync_state.active) {
+        printf("SYNC_STATUS state=BUSY target=%.3f left=%.3f right=%.3f "
+               "error=%.3f speed_l=%.3f speed_r=%.3f raw_l=%d raw_r=%d dl=%d dr=%d\n",
+               sync_state.target_abs_deg,
+               sync_state.last_left_progress_deg,
+               sync_state.last_right_progress_deg,
+               sync_state.last_error_deg,
+               sync_state.last_left_speed_cmd_deg_s,
+               sync_state.last_right_speed_cmd_deg_s,
+               raw_l,
+               raw_r,
+               dl,
+               dr);
+        return;
+    }
+    if (sync_state.done && sync_state.ever_started) {
+        printf("SYNC_STATUS state=DONE target=%.3f left=%.3f right=%.3f "
+               "error=%.3f raw_l=%d raw_r=%d dl=%d dr=%d\n",
+               sync_state.target_abs_deg,
+               sync_state.final_left_progress_deg,
+               sync_state.final_right_progress_deg,
+               sync_state.final_error_deg,
+               raw_l,
+               raw_r,
+               dl,
+               dr);
+        return;
+    }
+    if (have_encoder_counts) {
+        printf("SYNC_STATUS state=IDLE raw_l=%d raw_r=%d\n", raw_l, raw_r);
+        return;
+    }
+    printf("SYNC_STATUS state=IDLE\n");
+}
+
+static void handle_motors_sync_rot(char* rest) {
+    double abs_deg = 0.0;
+    double speed_deg_s = 0.0;
+    char left_dir_token[16];
+    char right_dir_token[16];
+    int left_dir_sign = 0;
+    int right_dir_sign = 0;
+    if (sscanf(rest, "%lf %15s %15s %lf",
+               &abs_deg, left_dir_token, right_dir_token, &speed_deg_s) != 4) {
+        force_motor_outputs_low();
+        printf("ERR INVALID_SYNC_TARGET\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!motors_runtime_enabled) {
+        force_motor_outputs_low();
+        printf("ERR MOTORS_DISABLED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (abs_deg <= 0.0) {
+        force_motor_outputs_low();
+        printf("ERR INVALID_SYNC_TARGET\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (speed_deg_s <= 0.0) {
+        force_motor_outputs_low();
+        printf("ERR INVALID_SYNC_SPEED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!parse_sync_dir(left_dir_token, &left_dir_sign) ||
+        !parse_sync_dir(right_dir_token, &right_dir_sign)) {
+        force_motor_outputs_low();
+        printf("ERR INVALID_SYNC_DIR\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (!motors_initialized || motor0 == NULL || motor1 == NULL) {
+        force_motor_outputs_low();
+        printf("ERR MOTORS_DISABLED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (sync_state.active) {
+        printf("ERR SYNC_BUSY\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+
+    motor0->disablePosPid();
+    motor1->disablePosPid();
+    restore_motor_pwm_outputs();
+    sync_state.active = true;
+    sync_state.done = false;
+    sync_state.ever_started = true;
+    sync_state.left_start_count = enc[1].get();
+    sync_state.right_start_count = enc[0].get();
+    sync_state.target_abs_deg = abs_deg;
+    sync_state.left_dir_sign = left_dir_sign;
+    sync_state.right_dir_sign = right_dir_sign;
+    sync_state.base_speed_deg_s = clamp_double(speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
+    sync_state.last_left_progress_deg = 0.0;
+    sync_state.last_right_progress_deg = 0.0;
+    sync_state.last_error_deg = 0.0;
+    sync_state.last_left_speed_cmd_deg_s = 0.0;
+    sync_state.last_right_speed_cmd_deg_s = 0.0;
+    sync_state.final_left_progress_deg = 0.0;
+    sync_state.final_right_progress_deg = 0.0;
+    sync_state.final_error_deg = 0.0;
+    sync_update();
+
+    printf("OK MOTORS_SYNC_ROT target=%.3f left_dir=%c right_dir=%c speed=%.3f\n",
+           sync_state.target_abs_deg,
+           sync_dir_char(sync_state.left_dir_sign),
+           sync_dir_char(sync_state.right_dir_sign),
+           sync_state.base_speed_deg_s);
+    fflush(stdout);
+    set_led_char('M');
+}
+
 static void handle_gpio_read(char* rest) {
     int gpio = -1;
     if (!parse_one_int(rest, &gpio)) {
@@ -593,20 +960,21 @@ static void handle_pwm_off(char* rest) {
 }
 
 static bool timer_cb(repeating_timer_t* rt) {
-    if (!motors_runtime_enabled) {
+    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
         return timer_started;
     }
-    motor[0].timer_cb();
-    motor[1].timer_cb();
+    sync_update();
+    motor0->timer_cb();
+    motor1->timer_cb();
     return timer_started;
 }
 
 static bool timer_cb_pos(repeating_timer_t* rt) {
-    if (!motors_runtime_enabled) {
+    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
         return timer_started;
     }
-    motor[0].timer_cb_pos();
-    motor[1].timer_cb_pos();
+    motor0->timer_cb_pos();
+    motor1->timer_cb_pos();
     return timer_started;
 }
 
@@ -629,48 +997,68 @@ static void stop_motor_timers() {
 }
 
 static void stop_motors_if_enabled() {
-    if (!motors_initialized) {
+    if (!motors_initialized || motor0 == NULL || motor1 == NULL) {
+        force_motor_outputs_low();
         return;
     }
-    motor[0].disablePosPid();
-    motor[1].disablePosPid();
-    motor[0].setVel(0);
-    motor[1].setVel(0);
+    sync_cancel(false);
+    motor0->disablePosPid();
+    motor1->disablePosPid();
+    motor0->setVel(0);
+    motor1->setVel(0);
+    force_motor_outputs_low();
 }
 
 static void configure_motor_gains() {
-    motor[0].setVelGain(1, 0.0, 0.09);
-    motor[0].setPosGain(2.5, 0.0, 0.09);
-    motor[1].setVelGain(1, 0.0, 0.09);
-    motor[1].setPosGain(2.5, 0.0, 0.09);
+    if (motor0 == NULL || motor1 == NULL) {
+        return;
+    }
+    motor0->setVelGain(1, 0.0, 0.09);
+    motor0->setPosGain(2.5, 0.0, 0.09);
+    motor1->setVelGain(1, 0.0, 0.09);
+    motor1->setPosGain(2.5, 0.0, 0.09);
 }
 
 static bool enable_motors() {
+    force_motor_outputs_low();
     if (motors_pin_conflict()) {
+        force_motor_outputs_low();
         return false;
     }
+    if (!create_motor_objects_if_needed()) {
+        force_motor_outputs_low();
+        return false;
+    }
+    force_motor_outputs_low();
 
     if (!motors_initialized) {
         gpio_set_dir(MOTOR_QENC0_GPIO, GPIO_IN);
         gpio_set_dir(MOTOR_QENC0_GPIO + 1, GPIO_IN);
         gpio_set_dir(MOTOR_QENC1_GPIO, GPIO_IN);
         gpio_set_dir(MOTOR_QENC1_GPIO + 1, GPIO_IN);
-        motor[0].init();
-        motor[1].init();
+        motor0->init();
+        motor1->init();
         configure_motor_gains();
         motors_initialized = true;
+    } else {
+        configure_motor_gains();
     }
 
     motors_runtime_enabled = true;
     stop_motors_if_enabled();
+    motor0->setVel(0);
+    motor1->setVel(0);
     start_motor_timers();
+    force_motor_outputs_low();
     return true;
 }
 
 static void disable_motors() {
+    sync_cancel(true);
     stop_motors_if_enabled();
     motors_runtime_enabled = false;
     stop_motor_timers();
+    force_motor_outputs_low();
 }
 
 static bool enable_servo() {
@@ -690,9 +1078,14 @@ static void disable_servo() {
 }
 
 static void safe_all() {
+    sync_cancel(true);
+    stop_motors_if_enabled();
+    motors_runtime_enabled = false;
+    force_motor_outputs_low();
     disable_motors();
     disable_servo();
     diag_all_low();
+    force_motor_outputs_low();
 }
 
 static void print_status() {
@@ -737,11 +1130,16 @@ static void print_encoder_status() {
 static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
+           "MOTORS_SYNC_ROT <abs_deg> <left_dir> <right_dir> <speed_deg_s>, "
+           "MOTORS_SYNC_STATUS, MOTORS_SYNC_CANCEL, ENCODER, "
            "PIN_STATUS, GPIO_READ <gpio>, GPIO_HIGH <gpio>, GPIO_LOW <gpio>, "
            "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
-           "DIAG_ALL_LOW, ENCODER, motor commands\n");
+           "DIAG_ALL_LOW, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
+    printf("SERVO: 2 <mode> <angle_deg>\n");
     printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
+    printf("MOTORS_SYNC_ROT: left/right are physical wheels; "
+           "left=motor1/enc1 right=motor0/enc0; + is CCW from rover side\n");
 }
 
 static bool handle_text_command(char* line) {
@@ -851,6 +1249,25 @@ static bool handle_text_command(char* line) {
         return true;
     }
 
+    if (strcmp(command, "MOTORS_SYNC_ROT") == 0) {
+        handle_motors_sync_rot(rest);
+        return true;
+    }
+
+    if (strcmp(command, "MOTORS_SYNC_STATUS") == 0) {
+        print_sync_status();
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "MOTORS_SYNC_CANCEL") == 0) {
+        sync_cancel(true);
+        set_led_char('S');
+        printf("OK MOTORS_SYNC_CANCEL\n");
+        fflush(stdout);
+        return true;
+    }
+
     if (strcmp(command, "STOP") == 0) {
         stop_motors_if_enabled();
         set_led_char('S');
@@ -947,6 +1364,7 @@ static bool readline(char* line, int line_size) {
 }
 
 int main() {
+    force_motor_outputs_low();
     init_led();
     init_uart_stdio();
     set_led_char('L');
@@ -956,6 +1374,7 @@ int main() {
     while (true) {
         service_led();
         if (!readline(buf, sizeof(buf))) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR line_too_long\n");
             fflush(stdout);
@@ -975,6 +1394,7 @@ int main() {
         printf("DBG parse n=%d id=%d mode=%d val=%.3f\n", parsed, id, mode, val);
         fflush(stdout);
         if (parsed != 3) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR parse raw=\"%s\"\n", buf);
             fflush(stdout);
@@ -985,14 +1405,25 @@ int main() {
         fflush(stdout);
 
         if (id < 0 || id > 2) {
+            force_motor_outputs_low();
             set_led_char('I');
             printf("ERR id out_of_range id=%d\n", id);
             fflush(stdout);
             continue;
         }
-        if ((id == 0 || id == 1) && !motors_runtime_enabled) {
+        if ((id == 0 || id == 1) &&
+            (!motors_runtime_enabled || !motors_initialized ||
+             motor0 == NULL || motor1 == NULL)) {
+            force_motor_outputs_low();
             set_led_char('E');
             printf("ERR MOTORS_DISABLED\n");
+            fflush(stdout);
+            continue;
+        }
+        if ((id == 0 || id == 1) && sync_state.active) {
+            force_motor_outputs_low();
+            set_led_char('E');
+            printf("ERR SYNC_BUSY\n");
             fflush(stdout);
             continue;
         }
@@ -1003,6 +1434,7 @@ int main() {
             continue;
         }
         if ((id == 0 || id == 1) && mode != 0 && mode != 1) {
+            force_motor_outputs_low();
             set_led_char('I');
             printf("ERR mode invalid id=%d mode=%d\n", id, mode);
             fflush(stdout);
@@ -1011,24 +1443,26 @@ int main() {
 
         switch (id) {
             case 0:
+                restore_motor_pwm_outputs();
                 if (!mode) {
-                    motor[0].disablePosPid();
-                    motor[0].setVel(val);
+                    motor0->disablePosPid();
+                    motor0->setVel(val);
                     printf("OK motor id=0 mode=vel target=%.3f\n", val);
                 } else {
-                    motor[0].resetPos();
-                    motor[0].setPos(val);
+                    motor0->resetPos();
+                    motor0->setPos(val);
                     printf("OK motor id=0 mode=pos target=%.3f\n", val);
                 }
                 break;
             case 1:
+                restore_motor_pwm_outputs();
                 if (!mode) {
-                    motor[1].disablePosPid();
-                    motor[1].setVel(val);
+                    motor1->disablePosPid();
+                    motor1->setVel(val);
                     printf("OK motor id=1 mode=vel target=%.3f\n", val);
                 } else {
-                    motor[1].resetPos();
-                    motor[1].setPos(val);
+                    motor1->resetPos();
+                    motor1->setPos(val);
                     printf("OK motor id=1 mode=pos target=%.3f\n", val);
                 }
                 break;
