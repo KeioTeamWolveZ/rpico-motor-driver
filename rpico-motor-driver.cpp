@@ -141,6 +141,7 @@ static bool motors_initialized = false;
 static bool servo_runtime_enabled = false;
 static bool servo_initialized = false;
 static bool timer_started = false;
+static volatile bool sync_start_initializing = false;
 static SyncRotationState sync_state = {};
 static repeating_timer_t velocity_timer;
 static repeating_timer_t position_timer;
@@ -592,8 +593,8 @@ static void sync_cancel(bool stop_motors) {
     sync_state.last_left_speed_cmd_deg_s = 0.0;
     sync_state.last_right_speed_cmd_deg_s = 0.0;
     if (stop_motors && motors_initialized && motor0 != NULL && motor1 != NULL) {
-        motor0->setVel(0);
-        motor1->setVel(0);
+        motor0->resetControlState();
+        motor1->resetControlState();
     }
     if (stop_motors) {
         force_motor_outputs_low();
@@ -771,10 +772,13 @@ static void handle_motors_sync_rot(char* rest) {
         return;
     }
 
-    motor0->disablePosPid();
-    motor1->disablePosPid();
-    restore_motor_pwm_outputs();
-    sync_state.active = true;
+    sync_start_initializing = true;
+    sync_state.active = false;
+
+    motor0->resetControlState();
+    motor1->resetControlState();
+    force_motor_outputs_low();
+
     sync_state.done = false;
     sync_state.ever_started = true;
     sync_state.left_start_count = enc[1].get();
@@ -791,6 +795,12 @@ static void handle_motors_sync_rot(char* rest) {
     sync_state.final_left_progress_deg = 0.0;
     sync_state.final_right_progress_deg = 0.0;
     sync_state.final_error_deg = 0.0;
+
+    restore_motor_pwm_outputs();
+    motor0->resetControlState();
+    motor1->resetControlState();
+    sync_state.active = true;
+    sync_start_initializing = false;
     sync_update();
 
     printf("OK MOTORS_SYNC_ROT target=%.3f left_dir=%c right_dir=%c speed=%.3f\n",
@@ -960,7 +970,8 @@ static void handle_pwm_off(char* rest) {
 }
 
 static bool timer_cb(repeating_timer_t* rt) {
-    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
+    if (sync_start_initializing || !motors_runtime_enabled || !motors_initialized ||
+        motor0 == NULL || motor1 == NULL) {
         return timer_started;
     }
     sync_update();
@@ -970,7 +981,8 @@ static bool timer_cb(repeating_timer_t* rt) {
 }
 
 static bool timer_cb_pos(repeating_timer_t* rt) {
-    if (!motors_runtime_enabled || !motors_initialized || motor0 == NULL || motor1 == NULL) {
+    if (sync_start_initializing || !motors_runtime_enabled || !motors_initialized ||
+        motor0 == NULL || motor1 == NULL) {
         return timer_started;
     }
     motor0->timer_cb_pos();
@@ -1002,10 +1014,8 @@ static void stop_motors_if_enabled() {
         return;
     }
     sync_cancel(false);
-    motor0->disablePosPid();
-    motor1->disablePosPid();
-    motor0->setVel(0);
-    motor1->setVel(0);
+    motor0->resetControlState();
+    motor1->resetControlState();
     force_motor_outputs_low();
 }
 
@@ -1046,8 +1056,8 @@ static bool enable_motors() {
 
     motors_runtime_enabled = true;
     stop_motors_if_enabled();
-    motor0->setVel(0);
-    motor1->setVel(0);
+    motor0->resetControlState();
+    motor1->resetControlState();
     start_motor_timers();
     force_motor_outputs_low();
     return true;
