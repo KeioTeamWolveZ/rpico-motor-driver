@@ -544,6 +544,23 @@ static double min_double(double a, double b) {
     return a < b ? a : b;
 }
 
+static double calculate_sync_wheel_base_speed(double remaining_deg,
+                                              double requested_speed_deg_s) {
+    if (remaining_deg <= 0.0) {
+        return 0.0;
+    }
+
+    double base_speed =
+        min_double(requested_speed_deg_s, SYNC_SLOWDOWN_GAIN * remaining_deg);
+    if (base_speed < 0.0) {
+        base_speed = 0.0;
+    }
+    if (remaining_deg > SYNC_TOLERANCE_DEG && base_speed < SYNC_MIN_SPEED_DEG_S) {
+        base_speed = SYNC_MIN_SPEED_DEG_S;
+    }
+    return base_speed;
+}
+
 static bool token_equals_ignore_case(const char* a, const char* b) {
     while (*a != 0 && *b != 0) {
         if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) {
@@ -637,23 +654,24 @@ static void sync_update() {
 
     double left_remaining = sync_state.target_abs_deg - left_progress_deg;
     double right_remaining = sync_state.target_abs_deg - right_progress_deg;
-    double remaining_min = min_double(left_remaining, right_remaining);
     double requested_speed =
         clamp_double(sync_state.base_speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
-    double base_speed_abs =
-        min_double(requested_speed, SYNC_SLOWDOWN_GAIN * remaining_min);
-    if (base_speed_abs < 0.0) {
-        base_speed_abs = 0.0;
-    }
-    if (remaining_min > SYNC_TOLERANCE_DEG && base_speed_abs < SYNC_MIN_SPEED_DEG_S) {
-        base_speed_abs = SYNC_MIN_SPEED_DEG_S;
-    }
+    double left_base_speed_abs =
+        calculate_sync_wheel_base_speed(left_remaining, requested_speed);
+    double right_base_speed_abs =
+        calculate_sync_wheel_base_speed(right_remaining, requested_speed);
 
     double correction = SYNC_KP * error_deg + SYNC_KD * 0.0;
     double left_speed_abs =
-        clamp_double(base_speed_abs - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
+        clamp_double(left_base_speed_abs - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
     double right_speed_abs =
-        clamp_double(base_speed_abs + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
+        clamp_double(right_base_speed_abs + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
+    if (left_remaining <= 0.0) {
+        left_speed_abs = 0.0;
+    }
+    if (right_remaining <= 0.0) {
+        right_speed_abs = 0.0;
+    }
     double left_physical_speed = sync_state.left_dir_sign * left_speed_abs;
     double right_physical_speed = sync_state.right_dir_sign * right_speed_abs;
     double left_internal_cmd = -left_physical_speed;
