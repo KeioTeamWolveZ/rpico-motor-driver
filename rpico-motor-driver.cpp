@@ -95,7 +95,10 @@ static const double ENCODER_COUNTS_PER_REV = 3900.0;
 static const double SYNC_KP = 0.30;
 static const double SYNC_KD = 0.00;
 static const double SYNC_TOLERANCE_DEG = 3.0;
+static const double SYNC_TOLERANCE_RATIO = 0.20;
 static const double SYNC_MIN_SPEED_DEG_S = 20.0;
+static const double SYNC_SMALL_TARGET_MIN_SPEED_DEG_S = 30.0;
+static const double SYNC_SMALL_TARGET_MAX_DEG = 15.0;
 static const double SYNC_MAX_SPEED_DEG_S = 180.0;
 static const double SYNC_SLOWDOWN_GAIN = 1.2;
 
@@ -544,9 +547,35 @@ static double min_double(double a, double b) {
     return a < b ? a : b;
 }
 
+static double max_double(double a, double b) {
+    return a > b ? a : b;
+}
+
+static double calculate_sync_tolerance_deg(double target_abs_deg) {
+    if (target_abs_deg <= 0.0) {
+        return 0.0;
+    }
+    return min_double(SYNC_TOLERANCE_DEG,
+                      target_abs_deg * SYNC_TOLERANCE_RATIO);
+}
+
+static double calculate_sync_done_threshold_deg(double target_abs_deg) {
+    double tolerance_deg = calculate_sync_tolerance_deg(target_abs_deg);
+    return max_double(0.0, target_abs_deg - tolerance_deg);
+}
+
+static double calculate_sync_min_speed_deg_s(double target_abs_deg) {
+    if (target_abs_deg <= SYNC_SMALL_TARGET_MAX_DEG) {
+        return SYNC_SMALL_TARGET_MIN_SPEED_DEG_S;
+    }
+    return SYNC_MIN_SPEED_DEG_S;
+}
+
 static double calculate_sync_wheel_base_speed(double remaining_deg,
-                                              double requested_speed_deg_s) {
-    if (remaining_deg <= 0.0) {
+                                              double requested_speed_deg_s,
+                                              double tolerance_deg,
+                                              double min_speed_deg_s) {
+    if (remaining_deg <= tolerance_deg) {
         return 0.0;
     }
 
@@ -555,10 +584,10 @@ static double calculate_sync_wheel_base_speed(double remaining_deg,
     if (base_speed < 0.0) {
         base_speed = 0.0;
     }
-    if (remaining_deg > SYNC_TOLERANCE_DEG && base_speed < SYNC_MIN_SPEED_DEG_S) {
-        base_speed = SYNC_MIN_SPEED_DEG_S;
+    if (base_speed < min_speed_deg_s) {
+        base_speed = min_speed_deg_s;
     }
-    return base_speed;
+    return clamp_double(base_speed, 0.0, SYNC_MAX_SPEED_DEG_S);
 }
 
 static bool token_equals_ignore_case(const char* a, const char* b) {
@@ -638,8 +667,15 @@ static void sync_update() {
     sync_state.last_right_progress_deg = right_progress_deg;
     sync_state.last_error_deg = error_deg;
 
-    if (left_progress_deg >= sync_state.target_abs_deg - SYNC_TOLERANCE_DEG &&
-        right_progress_deg >= sync_state.target_abs_deg - SYNC_TOLERANCE_DEG) {
+    double effective_tolerance_deg =
+        calculate_sync_tolerance_deg(sync_state.target_abs_deg);
+    double done_threshold_deg =
+        calculate_sync_done_threshold_deg(sync_state.target_abs_deg);
+    double min_speed_deg_s =
+        calculate_sync_min_speed_deg_s(sync_state.target_abs_deg);
+
+    if (left_progress_deg >= done_threshold_deg &&
+        right_progress_deg >= done_threshold_deg) {
         motor0->setVel(0);
         motor1->setVel(0);
         sync_state.last_left_speed_cmd_deg_s = 0.0;
@@ -657,19 +693,25 @@ static void sync_update() {
     double requested_speed =
         clamp_double(sync_state.base_speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
     double left_base_speed_abs =
-        calculate_sync_wheel_base_speed(left_remaining, requested_speed);
+        calculate_sync_wheel_base_speed(left_remaining,
+                                        requested_speed,
+                                        effective_tolerance_deg,
+                                        min_speed_deg_s);
     double right_base_speed_abs =
-        calculate_sync_wheel_base_speed(right_remaining, requested_speed);
+        calculate_sync_wheel_base_speed(right_remaining,
+                                        requested_speed,
+                                        effective_tolerance_deg,
+                                        min_speed_deg_s);
 
     double correction = SYNC_KP * error_deg + SYNC_KD * 0.0;
     double left_speed_abs =
         clamp_double(left_base_speed_abs - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
     double right_speed_abs =
         clamp_double(right_base_speed_abs + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
-    if (left_remaining <= 0.0) {
+    if (left_remaining <= effective_tolerance_deg) {
         left_speed_abs = 0.0;
     }
-    if (right_remaining <= 0.0) {
+    if (right_remaining <= effective_tolerance_deg) {
         right_speed_abs = 0.0;
     }
     double left_physical_speed = sync_state.left_dir_sign * left_speed_abs;
