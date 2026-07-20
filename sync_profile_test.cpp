@@ -9,8 +9,8 @@ static const double SYNC_TOLERANCE_RATIO = 0.20;
 static const double SYNC_MIN_SPEED_DEG_S = 20.0;
 static const double SYNC_SMALL_TARGET_MIN_SPEED_DEG_S = 30.0;
 static const double SYNC_SMALL_TARGET_MAX_DEG = 15.0;
-static const double SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S = 40.0;
-static const uint64_t SYNC_SMALL_TARGET_START_BOOST_MAX_US = 150000;
+static const double SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S = 80.0;
+static const uint64_t SYNC_SMALL_TARGET_START_BOOST_MAX_US = 300000;
 static const int SYNC_START_BOOST_PROGRESS_COUNTS = 1;
 static const double SYNC_MAX_SPEED_DEG_S = 180.0;
 static const double SYNC_SLOWDOWN_GAIN = 1.2;
@@ -263,19 +263,19 @@ int main() {
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 0);
     expect_true("boost start left active", r.left_boost_active);
     expect_true("boost start right active", r.right_boost_active);
-    expect_close("boost start left", r.left_abs, 40.0);
-    expect_close("boost start right", r.right_abs, 40.0);
+    expect_close("boost start left", r.left_abs, 80.0);
+    expect_close("boost start right", r.right_abs, 80.0);
 
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 1, 0, 10000);
     expect_false("left movement releases left boost", r.left_boost_active);
     expect_true("right boost continues", r.right_boost_active);
     expect_close("left released speed", r.left_abs, 30.0);
-    expect_close("right still boosted speed", r.right_abs, 40.0);
+    expect_close("right still boosted speed", r.right_abs, 80.0);
 
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 1, 10000);
     expect_true("left boost continues", r.left_boost_active);
     expect_false("right movement releases right boost", r.right_boost_active);
-    expect_close("left still boosted speed", r.left_abs, 40.0);
+    expect_close("left still boosted speed", r.left_abs, 80.0);
     expect_close("right released speed", r.right_abs, 30.0);
 
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 1, 1, 10000);
@@ -284,15 +284,25 @@ int main() {
     expect_close("both released left", r.left_abs, 30.0);
     expect_close("both released right", r.right_abs, 30.0);
 
-    r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 149999);
+    r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 299999);
     expect_true("boost before max left", r.left_boost_active);
     expect_true("boost before max right", r.right_boost_active);
 
-    r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 150000);
+    r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 300000);
     expect_false("boost max releases left", r.left_boost_active);
     expect_false("boost max releases right", r.right_boost_active);
     expect_close("boost max left speed", r.left_abs, 30.0);
     expect_close("boost max right speed", r.right_abs, 30.0);
+
+    r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 300001);
+    expect_false("boost after max releases left", r.left_boost_active);
+    expect_false("boost after max releases right", r.right_boost_active);
+
+    r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, -1, -1, 10000);
+    expect_true("reverse count keeps left boost", r.left_boost_active);
+    expect_true("reverse count keeps right boost", r.right_boost_active);
+    expect_close("reverse count boosted left", r.left_abs, 80.0);
+    expect_close("reverse count boosted right", r.right_abs, 80.0);
 
     r = calculate_sync_speeds(5.0, 0.0, 4.8, 180.0);
     expect_false("case 2 not done", r.done);
@@ -303,7 +313,7 @@ int main() {
     r = calculate_sync_speeds(5.0, 0.0, 4.8, 180.0, true, true, 0, 0, 10000);
     expect_true("lagging left boost active", r.left_boost_active);
     expect_false("leading right boost inactive in tolerance", r.right_boost_active);
-    expect_close("boosted right lead left", r.left_abs, 41.44);
+    expect_close("boosted right lead left", r.left_abs, 81.44);
     expect_close("boosted right lead right", r.right_abs, 0.0);
 
     r = calculate_sync_speeds(5.0, 3.5, 4.8, 180.0);
@@ -314,7 +324,7 @@ int main() {
     r = calculate_sync_speeds(5.0, 3.5, 4.8, 180.0, true, true, 0, 0, 10000);
     expect_true("lagging left boost remains active", r.left_boost_active);
     expect_false("right tolerance disables boost", r.right_boost_active);
-    expect_close("boosted case 3 left", r.left_abs, 40.39);
+    expect_close("boosted case 3 left", r.left_abs, 80.39);
     expect_close("boosted case 3 right", r.right_abs, 0.0);
 
     r = calculate_sync_speeds(5.0, 4.0, 4.8, 180.0);
@@ -333,7 +343,7 @@ int main() {
     r = calculate_sync_speeds(5.0, 3.99, 5.2, 180.0, true, true, 0, 0, 10000);
     expect_true("case 6 left boost active", r.left_boost_active);
     expect_false("case 6 right boost inactive", r.right_boost_active);
-    expect_close("boosted case 6 left", r.left_abs, 40.363);
+    expect_close("boosted case 6 left", r.left_abs, 80.363);
     expect_close("boosted case 6 right", r.right_abs, 0.0);
 
     r = calculate_sync_speeds(5.0, 5.5, 3.0, 180.0);
@@ -345,7 +355,7 @@ int main() {
     expect_false("overshoot left boost inactive", r.left_boost_active);
     expect_true("right boost active after left overshoot", r.right_boost_active);
     expect_close("boosted case 7 left", r.left_abs, 0.0);
-    expect_close("boosted case 7 right", r.right_abs, 40.75);
+    expect_close("boosted case 7 right", r.right_abs, 80.75);
 
     r = calculate_sync_speeds(5.0, 4.8, 0.0, 180.0);
     expect_close("left lead left", r.left_abs, 0.0);
@@ -412,8 +422,8 @@ int main() {
     expect_close("small target min beats requested right", r.right_abs, 30.0);
 
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 10.0, true, true, 0, 0, 0);
-    expect_close("boost beats requested left", r.left_abs, 40.0);
-    expect_close("boost beats requested right", r.right_abs, 40.0);
+    expect_close("boost beats requested left", r.left_abs, 80.0);
+    expect_close("boost beats requested right", r.right_abs, 80.0);
 
     r = calculate_sync_speeds(30.0, 20.0, 20.0, 10.0);
     expect_close("normal target min beats requested left", r.left_abs, 20.0);
