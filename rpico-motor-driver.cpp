@@ -99,6 +99,9 @@ static const double SYNC_TOLERANCE_RATIO = 0.20;
 static const double SYNC_MIN_SPEED_DEG_S = 20.0;
 static const double SYNC_SMALL_TARGET_MIN_SPEED_DEG_S = 30.0;
 static const double SYNC_SMALL_TARGET_MAX_DEG = 15.0;
+static const double SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S = 40.0;
+static const uint64_t SYNC_SMALL_TARGET_START_BOOST_MAX_US = 150000;
+static const int SYNC_START_BOOST_PROGRESS_COUNTS = 1;
 static const double SYNC_MAX_SPEED_DEG_S = 180.0;
 static const double SYNC_SLOWDOWN_GAIN = 1.2;
 
@@ -120,6 +123,10 @@ struct SyncRotationState {
     double final_left_progress_deg;
     double final_right_progress_deg;
     double final_error_deg;
+    bool start_boost_enabled;
+    bool left_start_boost_active;
+    bool right_start_boost_active;
+    uint64_t start_boost_start_us;
 };
 
 Servo servo(MOTOR_SERVO_GPIO);
@@ -571,6 +578,31 @@ static double calculate_sync_min_speed_deg_s(double target_abs_deg) {
     return SYNC_MIN_SPEED_DEG_S;
 }
 
+static bool sync_start_boost_target_enabled(double target_abs_deg) {
+    return target_abs_deg <= SYNC_SMALL_TARGET_MAX_DEG;
+}
+
+static bool sync_start_boost_wheel_active(bool boost_enabled,
+                                          bool boost_active,
+                                          int directed_progress_count,
+                                          double remaining_deg,
+                                          double tolerance_deg,
+                                          uint64_t elapsed_us) {
+    if (!boost_enabled || !boost_active) {
+        return false;
+    }
+    if (remaining_deg <= tolerance_deg) {
+        return false;
+    }
+    if (directed_progress_count >= SYNC_START_BOOST_PROGRESS_COUNTS) {
+        return false;
+    }
+    if (elapsed_us >= SYNC_SMALL_TARGET_START_BOOST_MAX_US) {
+        return false;
+    }
+    return true;
+}
+
 static double calculate_sync_wheel_base_speed(double remaining_deg,
                                               double requested_speed_deg_s,
                                               double tolerance_deg,
@@ -588,6 +620,13 @@ static double calculate_sync_wheel_base_speed(double remaining_deg,
         base_speed = min_speed_deg_s;
     }
     return clamp_double(base_speed, 0.0, SYNC_MAX_SPEED_DEG_S);
+}
+
+static double apply_sync_start_boost(double base_speed_deg_s, bool boost_active) {
+    if (boost_active && base_speed_deg_s < SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S) {
+        return SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S;
+    }
+    return base_speed_deg_s;
 }
 
 static bool token_equals_ignore_case(const char* a, const char* b) {
@@ -638,6 +677,10 @@ static void sync_cancel(bool stop_motors) {
     sync_state.ever_started = false;
     sync_state.last_left_speed_cmd_deg_s = 0.0;
     sync_state.last_right_speed_cmd_deg_s = 0.0;
+    sync_state.start_boost_enabled = false;
+    sync_state.left_start_boost_active = false;
+    sync_state.right_start_boost_active = false;
+    sync_state.start_boost_start_us = 0;
     if (stop_motors && motors_initialized && motor0 != NULL && motor1 != NULL) {
         motor0->resetControlState();
         motor1->resetControlState();
@@ -655,6 +698,8 @@ static void sync_update() {
 
     int left_delta_count = enc[1].get() - sync_state.left_start_count;
     int right_delta_count = enc[0].get() - sync_state.right_start_count;
+    int left_directed_progress_count = -sync_state.left_dir_sign * left_delta_count;
+    int right_directed_progress_count = -sync_state.right_dir_sign * right_delta_count;
     // Existing position control uses internal motor sign = -physical sign.
     // Apply the same convention so commanded physical motion increases progress.
     double left_progress_deg =
@@ -685,11 +730,31 @@ static void sync_update() {
         sync_state.final_error_deg = error_deg;
         sync_state.active = false;
         sync_state.done = true;
+        sync_state.start_boost_enabled = false;
+        sync_state.left_start_boost_active = false;
+        sync_state.right_start_boost_active = false;
+        sync_state.start_boost_start_us = 0;
         return;
     }
 
     double left_remaining = sync_state.target_abs_deg - left_progress_deg;
     double right_remaining = sync_state.target_abs_deg - right_progress_deg;
+    uint64_t elapsed_boost_us = time_us_64() - sync_state.start_boost_start_us;
+    sync_state.left_start_boost_active =
+        sync_start_boost_wheel_active(sync_state.start_boost_enabled,
+                                      sync_state.left_start_boost_active,
+                                      left_directed_progress_count,
+                                      left_remaining,
+                                      effective_tolerance_deg,
+                                      elapsed_boost_us);
+    sync_state.right_start_boost_active =
+        sync_start_boost_wheel_active(sync_state.start_boost_enabled,
+                                      sync_state.right_start_boost_active,
+                                      right_directed_progress_count,
+                                      right_remaining,
+                                      effective_tolerance_deg,
+                                      elapsed_boost_us);
+
     double requested_speed =
         clamp_double(sync_state.base_speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
     double left_base_speed_abs =
@@ -697,11 +762,17 @@ static void sync_update() {
                                         requested_speed,
                                         effective_tolerance_deg,
                                         min_speed_deg_s);
+    left_base_speed_abs =
+        apply_sync_start_boost(left_base_speed_abs,
+                               sync_state.left_start_boost_active);
     double right_base_speed_abs =
         calculate_sync_wheel_base_speed(right_remaining,
                                         requested_speed,
                                         effective_tolerance_deg,
                                         min_speed_deg_s);
+    right_base_speed_abs =
+        apply_sync_start_boost(right_base_speed_abs,
+                               sync_state.right_start_boost_active);
 
     double correction = SYNC_KP * error_deg + SYNC_KD * 0.0;
     double left_speed_abs =
@@ -855,10 +926,15 @@ static void handle_motors_sync_rot(char* rest) {
     sync_state.final_left_progress_deg = 0.0;
     sync_state.final_right_progress_deg = 0.0;
     sync_state.final_error_deg = 0.0;
+    sync_state.start_boost_enabled = sync_start_boost_target_enabled(abs_deg);
+    sync_state.left_start_boost_active = sync_state.start_boost_enabled;
+    sync_state.right_start_boost_active = sync_state.start_boost_enabled;
+    sync_state.start_boost_start_us = 0;
 
     restore_motor_pwm_outputs();
     motor0->resetControlState();
     motor1->resetControlState();
+    sync_state.start_boost_start_us = time_us_64();
     sync_state.active = true;
     sync_start_initializing = false;
     sync_update();
