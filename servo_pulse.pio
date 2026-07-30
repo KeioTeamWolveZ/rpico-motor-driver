@@ -1,0 +1,12 @@
+.program servo_pulse
+.side_set 1
+
+; The CPU queues one encoded HIGH duration every 20 ms. While the TX FIFO is
+; empty, PULL stalls with side-set LOW, so a missing frame can never leave the
+; servo signal HIGH.
+.wrap_target
+    pull block          side 0
+    mov x, osr         side 1
+high_loop:
+    jmp x-- high_loop  side 1
+.wrap
