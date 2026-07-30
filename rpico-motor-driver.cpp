@@ -1,12 +1,16 @@
 #include <ctype.h>
+#include <cmath>
 #include <new>
 #include <stdio.h>
 #include <string.h>
 
-#include "../lib/rpico-encoder-plus/qenc.h"
-#include "../lib/rpico-motor/motor.h"
-#include "../lib/rpico-pwm/pwm.h"
-#include "../lib/rpico-servo/servo.h"
+#include "firmware_logic.h"
+#include "lib/rpico-encoder-plus/qenc.h"
+#include "lib/rpico-motor/motor.h"
+#include "lib/rpico-pwm/pwm.h"
+#include "lib/rpico-servo/servo.h"
+#include "pio_servo_output.h"
+#include "hardware/clocks.h"
 #include "hardware/pio.h"
 #include "hardware/pwm.h"
 #include "hardware/uart.h"
@@ -92,18 +96,13 @@ static const uint32_t LOOP_ALIVE_SERVICE_US = 10000;
 static const int DIAG_MAX_GPIO = 29;
 static const int DIAG_PWM_FREQ = 50000;
 static const double ENCODER_COUNTS_PER_REV = 3900.0;
-static const double SYNC_KP = 0.30;
-static const double SYNC_KD = 0.00;
-static const double SYNC_TOLERANCE_DEG = 3.0;
-static const double SYNC_TOLERANCE_RATIO = 0.20;
-static const double SYNC_MIN_SPEED_DEG_S = 20.0;
-static const double SYNC_SMALL_TARGET_MIN_SPEED_DEG_S = 30.0;
-static const double SYNC_SMALL_TARGET_MAX_DEG = 15.0;
-static const double SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S = 80.0;
-static const uint64_t SYNC_SMALL_TARGET_START_BOOST_MAX_US = 300000;
-static const int SYNC_START_BOOST_PROGRESS_COUNTS = 1;
-static const double SYNC_MAX_SPEED_DEG_S = 180.0;
-static const double SYNC_SLOWDOWN_GAIN = 1.2;
+
+enum SyncError {
+    SYNC_ERROR_NONE = 0,
+    SYNC_ERROR_TOTAL_TIMEOUT,
+    SYNC_ERROR_LEFT_STALL,
+    SYNC_ERROR_RIGHT_STALL,
+};
 
 struct SyncRotationState {
     bool active;
@@ -127,9 +126,17 @@ struct SyncRotationState {
     bool left_start_boost_active;
     bool right_start_boost_active;
     uint64_t start_boost_start_us;
+    uint64_t operation_start_us;
+    uint64_t total_timeout_us;
+    uint64_t left_last_progress_us;
+    uint64_t right_last_progress_us;
+    int left_last_raw_count;
+    int right_last_raw_count;
+    SyncError error;
+    bool error_report_pending;
 };
 
-Servo servo(MOTOR_SERVO_GPIO);
+PioServoOutput servo_output(MOTOR_SERVO_GPIO);
 Qenc enc[2] = {Qenc(MOTOR_QENC0_GPIO), Qenc(MOTOR_QENC1_GPIO)};
 static Pwm* pwm0 = NULL;
 static Pwm* pwm1 = NULL;
@@ -146,19 +153,24 @@ static bool led_symbol_on = false;
 static int led_pattern_index = 0;
 static uint64_t led_next_event_us = 0;
 
-static bool motors_runtime_enabled = false;
-static bool motors_initialized = false;
+static volatile bool motors_runtime_enabled = false;
+static volatile bool motors_initialized = false;
 static bool servo_runtime_enabled = false;
-static bool servo_initialized = false;
-static bool timer_started = false;
+static volatile bool timer_started = false;
 static volatile bool sync_start_initializing = false;
-static SyncRotationState sync_state = {};
+static volatile SyncRotationState sync_state = {};
 static repeating_timer_t velocity_timer;
 static repeating_timer_t position_timer;
 static bool diag_high[DIAG_MAX_GPIO + 1] = {false};
 static bool diag_pwm[DIAG_MAX_GPIO + 1] = {false};
+static volatile bool motor_motion_command_active[2] = {false, false};
+static uint64_t last_complete_command_us = 0;
+static bool watchdog_report_pending = false;
+static const char* motor_enable_error = "NONE";
 
 static bool set_led_char(char led_char);
+static void safe_all();
+static void service_runtime_safety();
 
 static void force_motor_gpio_low(uint gpio) {
     gpio_init(gpio);
@@ -174,21 +186,17 @@ static void force_motor_outputs_low() {
     force_motor_gpio_low(MOTOR_PWM3_GPIO);
 }
 
-static void restore_motor_pwm_gpio(uint gpio) {
-    gpio_set_function(gpio, GPIO_FUNC_PWM);
-    uint slice = pwm_gpio_to_slice_num(gpio);
-    uint channel = pwm_gpio_to_channel(gpio);
-    pwm_set_clkdiv(slice, (float)125E6 / (2048 * DIAG_PWM_FREQ));
-    pwm_set_wrap(slice, 2047);
-    pwm_set_chan_level(slice, channel, 0);
-    pwm_set_enabled(slice, true);
-}
-
-static void restore_motor_pwm_outputs() {
-    restore_motor_pwm_gpio(MOTOR_PWM0_GPIO);
-    restore_motor_pwm_gpio(MOTOR_PWM1_GPIO);
-    restore_motor_pwm_gpio(MOTOR_PWM2_GPIO);
-    restore_motor_pwm_gpio(MOTOR_PWM3_GPIO);
+static bool restore_motor_pwm_outputs() {
+    if (pwm0 == NULL || pwm1 == NULL || pwm2 == NULL || pwm3 == NULL) {
+        force_motor_outputs_low();
+        return false;
+    }
+    bool restored = pwm0->restore() && pwm1->restore() &&
+                    pwm2->restore() && pwm3->restore();
+    if (!restored) {
+        force_motor_outputs_low();
+    }
+    return restored;
 }
 
 static bool create_motor_objects_if_needed() {
@@ -246,7 +254,23 @@ static bool diag_gpio_valid(int gpio) {
 }
 
 static bool diag_gpio_protected(int gpio) {
-    return gpio == 0 || gpio == 1 || gpio == 22 || gpio == 23 || gpio == 25;
+    const int motor_gpios[] = {
+        MOTOR_PWM0_GPIO, MOTOR_PWM1_GPIO,
+        MOTOR_PWM2_GPIO, MOTOR_PWM3_GPIO};
+    const int encoder_gpios[] = {
+        MOTOR_QENC0_GPIO, MOTOR_QENC0_GPIO + 1,
+        MOTOR_QENC1_GPIO, MOTOR_QENC1_GPIO + 1};
+    return firmware::is_diagnostic_protected_gpio(
+        gpio,
+        MOTOR_UART_TX_GPIO,
+        MOTOR_UART_RX_GPIO,
+        MOTOR_SERVO_GPIO,
+        motor_gpios,
+        sizeof(motor_gpios) / sizeof(motor_gpios[0]),
+        encoder_gpios,
+        sizeof(encoder_gpios) / sizeof(encoder_gpios[0]),
+        LED_PIN) ||
+        gpio == 22 || gpio == 23;
 }
 
 static bool diag_runtime_available() {
@@ -521,113 +545,49 @@ static void diag_all_low() {
 }
 
 static void print_pin_status() {
-    printf("PIN_STATUS PROTECTED=0,1,22,23,25 DIAG_HIGH=");
+    printf("PIN_STATUS PROTECTED=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d "
+           "DIAG_HIGH=",
+           MOTOR_UART_TX_GPIO, MOTOR_UART_RX_GPIO, MOTOR_SERVO_GPIO,
+           MOTOR_PWM0_GPIO, MOTOR_PWM1_GPIO, MOTOR_PWM2_GPIO, MOTOR_PWM3_GPIO,
+           MOTOR_QENC0_GPIO, MOTOR_QENC0_GPIO + 1,
+           MOTOR_QENC1_GPIO, MOTOR_QENC1_GPIO + 1,
+           LED_PIN, 22);
     print_diag_gpio_list(diag_high);
     printf(" DIAG_PWM=");
     print_diag_gpio_list(diag_pwm);
     printf(" MAX_GPIO=%d\n", DIAG_MAX_GPIO);
 }
 
-static bool parse_one_int(char* text, int* a) {
-    return sscanf(text, "%d", a) == 1;
-}
-
-static bool parse_two_ints(char* text, int* a, int* b) {
-    return sscanf(text, "%d %d", a, b) == 2;
-}
-
-static bool parse_three_ints(char* text, int* a, int* b, int* c) {
-    return sscanf(text, "%d %d %d", a, b, c) == 3;
-}
-
-static double clamp_double(double value, double min_value, double max_value) {
-    if (value < min_value) {
-        return min_value;
-    }
-    if (value > max_value) {
-        return max_value;
-    }
-    return value;
-}
-
-static double min_double(double a, double b) {
-    return a < b ? a : b;
-}
-
-static double max_double(double a, double b) {
-    return a > b ? a : b;
-}
-
-static double calculate_sync_tolerance_deg(double target_abs_deg) {
-    if (target_abs_deg <= 0.0) {
-        return 0.0;
-    }
-    return min_double(SYNC_TOLERANCE_DEG,
-                      target_abs_deg * SYNC_TOLERANCE_RATIO);
-}
-
-static double calculate_sync_done_threshold_deg(double target_abs_deg) {
-    double tolerance_deg = calculate_sync_tolerance_deg(target_abs_deg);
-    return max_double(0.0, target_abs_deg - tolerance_deg);
-}
-
-static double calculate_sync_min_speed_deg_s(double target_abs_deg) {
-    if (target_abs_deg <= SYNC_SMALL_TARGET_MAX_DEG) {
-        return SYNC_SMALL_TARGET_MIN_SPEED_DEG_S;
-    }
-    return SYNC_MIN_SPEED_DEG_S;
-}
-
-static bool sync_start_boost_target_enabled(double target_abs_deg) {
-    return target_abs_deg <= SYNC_SMALL_TARGET_MAX_DEG;
-}
-
-static bool sync_start_boost_wheel_active(bool boost_enabled,
-                                          bool boost_active,
-                                          int directed_progress_count,
-                                          double remaining_deg,
-                                          double tolerance_deg,
-                                          uint64_t elapsed_us) {
-    if (!boost_enabled || !boost_active) {
-        return false;
-    }
-    if (remaining_deg <= tolerance_deg) {
-        return false;
-    }
-    if (directed_progress_count >= SYNC_START_BOOST_PROGRESS_COUNTS) {
-        return false;
-    }
-    if (elapsed_us >= SYNC_SMALL_TARGET_START_BOOST_MAX_US) {
-        return false;
+static bool only_spaces(const char* text) {
+    while (*text != 0) {
+        if (!isspace((unsigned char)*text)) {
+            return false;
+        }
+        ++text;
     }
     return true;
 }
 
-static double calculate_sync_wheel_base_speed(double remaining_deg,
-                                              double requested_speed_deg_s,
-                                              double tolerance_deg,
-                                              double min_speed_deg_s) {
-    if (remaining_deg <= tolerance_deg) {
-        return 0.0;
-    }
-
-    double base_speed =
-        min_double(requested_speed_deg_s, SYNC_SLOWDOWN_GAIN * remaining_deg);
-    if (base_speed < 0.0) {
-        base_speed = 0.0;
-    }
-    if (base_speed < min_speed_deg_s) {
-        base_speed = min_speed_deg_s;
-    }
-    return clamp_double(base_speed, 0.0, SYNC_MAX_SPEED_DEG_S);
+static bool parse_one_int(char* text, int* a) {
+    int consumed = 0;
+    return sscanf(text, "%d %n", a, &consumed) == 1 &&
+           only_spaces(text + consumed);
 }
 
-static double apply_sync_start_boost(double base_speed_deg_s, bool boost_active) {
-    if (boost_active && base_speed_deg_s < SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S) {
-        return SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S;
-    }
-    return base_speed_deg_s;
+static bool parse_two_ints(char* text, int* a, int* b) {
+    int consumed = 0;
+    return sscanf(text, "%d %d %n", a, b, &consumed) == 2 &&
+           only_spaces(text + consumed);
 }
+
+static bool parse_three_ints(char* text, int* a, int* b, int* c) {
+    int consumed = 0;
+    return sscanf(text, "%d %d %d %n", a, b, c, &consumed) == 3 &&
+           only_spaces(text + consumed);
+}
+
+using firmware::clamp_double;
+using firmware::sync_start_boost_target_enabled;
 
 static bool token_equals_ignore_case(const char* a, const char* b) {
     while (*a != 0 && *b != 0) {
@@ -681,6 +641,14 @@ static void sync_cancel(bool stop_motors) {
     sync_state.left_start_boost_active = false;
     sync_state.right_start_boost_active = false;
     sync_state.start_boost_start_us = 0;
+    sync_state.operation_start_us = 0;
+    sync_state.total_timeout_us = 0;
+    sync_state.left_last_progress_us = 0;
+    sync_state.right_last_progress_us = 0;
+    sync_state.error = SYNC_ERROR_NONE;
+    sync_state.error_report_pending = false;
+    motor_motion_command_active[0] = false;
+    motor_motion_command_active[1] = false;
     if (stop_motors && motors_initialized && motor0 != NULL && motor1 != NULL) {
         motor0->resetControlState();
         motor1->resetControlState();
@@ -690,14 +658,51 @@ static void sync_cancel(bool stop_motors) {
     }
 }
 
+static const char* sync_error_string(SyncError error) {
+    switch (error) {
+        case SYNC_ERROR_NONE:
+            return "NONE";
+        case SYNC_ERROR_TOTAL_TIMEOUT:
+            return "TOTAL_TIMEOUT";
+        case SYNC_ERROR_LEFT_STALL:
+            return "LEFT_STALL";
+        case SYNC_ERROR_RIGHT_STALL:
+            return "RIGHT_STALL";
+    }
+    return "UNKNOWN";
+}
+
+static void sync_fail(SyncError error) {
+    sync_state.active = false;
+    sync_state.done = false;
+    sync_state.ever_started = true;
+    sync_state.error = error;
+    sync_state.error_report_pending = true;
+    sync_state.last_left_speed_cmd_deg_s = 0.0;
+    sync_state.last_right_speed_cmd_deg_s = 0.0;
+    sync_state.start_boost_enabled = false;
+    sync_state.left_start_boost_active = false;
+    sync_state.right_start_boost_active = false;
+    motor_motion_command_active[0] = false;
+    motor_motion_command_active[1] = false;
+    if (motor0 != NULL && motor1 != NULL) {
+        motor0->resetControlState();
+        motor1->resetControlState();
+    }
+    force_motor_outputs_low();
+}
+
 static void sync_update() {
     if (!sync_state.active || !motors_runtime_enabled || !motors_initialized ||
         motor0 == NULL || motor1 == NULL) {
         return;
     }
 
-    int left_delta_count = enc[1].get() - sync_state.left_start_count;
-    int right_delta_count = enc[0].get() - sync_state.right_start_count;
+    uint64_t now_us = time_us_64();
+    int left_raw_count = enc[1].get();
+    int right_raw_count = enc[0].get();
+    int left_delta_count = left_raw_count - sync_state.left_start_count;
+    int right_delta_count = right_raw_count - sync_state.right_start_count;
     int left_directed_progress_count = -sync_state.left_dir_sign * left_delta_count;
     int right_directed_progress_count = -sync_state.right_dir_sign * right_delta_count;
     // Existing position control uses internal motor sign = -physical sign.
@@ -711,16 +716,30 @@ static void sync_update() {
     sync_state.last_left_progress_deg = left_progress_deg;
     sync_state.last_right_progress_deg = right_progress_deg;
     sync_state.last_error_deg = error_deg;
+    if (left_raw_count != sync_state.left_last_raw_count) {
+        sync_state.left_last_raw_count = left_raw_count;
+        sync_state.left_last_progress_us = now_us;
+    }
+    if (right_raw_count != sync_state.right_last_raw_count) {
+        sync_state.right_last_raw_count = right_raw_count;
+        sync_state.right_last_progress_us = now_us;
+    }
 
-    double effective_tolerance_deg =
-        calculate_sync_tolerance_deg(sync_state.target_abs_deg);
-    double done_threshold_deg =
-        calculate_sync_done_threshold_deg(sync_state.target_abs_deg);
-    double min_speed_deg_s =
-        calculate_sync_min_speed_deg_s(sync_state.target_abs_deg);
+    uint64_t elapsed_boost_us =
+        now_us - sync_state.start_boost_start_us;
+    firmware::SyncSpeedResult speeds =
+        firmware::calculate_sync_speeds(
+            sync_state.target_abs_deg,
+            left_progress_deg,
+            right_progress_deg,
+            sync_state.base_speed_deg_s,
+            sync_state.left_start_boost_active,
+            sync_state.right_start_boost_active,
+            left_directed_progress_count,
+            right_directed_progress_count,
+            elapsed_boost_us);
 
-    if (left_progress_deg >= done_threshold_deg &&
-        right_progress_deg >= done_threshold_deg) {
+    if (speeds.done) {
         motor0->setVel(0);
         motor1->setVel(0);
         sync_state.last_left_speed_cmd_deg_s = 0.0;
@@ -734,57 +753,41 @@ static void sync_update() {
         sync_state.left_start_boost_active = false;
         sync_state.right_start_boost_active = false;
         sync_state.start_boost_start_us = 0;
+        sync_state.error = SYNC_ERROR_NONE;
+        motor_motion_command_active[0] = false;
+        motor_motion_command_active[1] = false;
         return;
     }
 
     double left_remaining = sync_state.target_abs_deg - left_progress_deg;
     double right_remaining = sync_state.target_abs_deg - right_progress_deg;
-    uint64_t elapsed_boost_us = time_us_64() - sync_state.start_boost_start_us;
-    sync_state.left_start_boost_active =
-        sync_start_boost_wheel_active(sync_state.start_boost_enabled,
-                                      sync_state.left_start_boost_active,
-                                      left_directed_progress_count,
-                                      left_remaining,
-                                      effective_tolerance_deg,
-                                      elapsed_boost_us);
-    sync_state.right_start_boost_active =
-        sync_start_boost_wheel_active(sync_state.start_boost_enabled,
-                                      sync_state.right_start_boost_active,
-                                      right_directed_progress_count,
-                                      right_remaining,
-                                      effective_tolerance_deg,
-                                      elapsed_boost_us);
-
-    double requested_speed =
-        clamp_double(sync_state.base_speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
-    double left_base_speed_abs =
-        calculate_sync_wheel_base_speed(left_remaining,
-                                        requested_speed,
-                                        effective_tolerance_deg,
-                                        min_speed_deg_s);
-    left_base_speed_abs =
-        apply_sync_start_boost(left_base_speed_abs,
-                               sync_state.left_start_boost_active);
-    double right_base_speed_abs =
-        calculate_sync_wheel_base_speed(right_remaining,
-                                        requested_speed,
-                                        effective_tolerance_deg,
-                                        min_speed_deg_s);
-    right_base_speed_abs =
-        apply_sync_start_boost(right_base_speed_abs,
-                               sync_state.right_start_boost_active);
-
-    double correction = SYNC_KP * error_deg + SYNC_KD * 0.0;
-    double left_speed_abs =
-        clamp_double(left_base_speed_abs - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
-    double right_speed_abs =
-        clamp_double(right_base_speed_abs + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
-    if (left_remaining <= effective_tolerance_deg) {
-        left_speed_abs = 0.0;
+    if (firmware::deadline_expired(
+            now_us,
+            sync_state.operation_start_us,
+            sync_state.total_timeout_us)) {
+        sync_fail(SYNC_ERROR_TOTAL_TIMEOUT);
+        return;
     }
-    if (right_remaining <= effective_tolerance_deg) {
-        right_speed_abs = 0.0;
+    if (left_remaining > speeds.tolerance &&
+        firmware::deadline_expired(
+            now_us,
+            sync_state.left_last_progress_us,
+            firmware::kSyncStallTimeoutUs)) {
+        sync_fail(SYNC_ERROR_LEFT_STALL);
+        return;
     }
+    if (right_remaining > speeds.tolerance &&
+        firmware::deadline_expired(
+            now_us,
+            sync_state.right_last_progress_us,
+            firmware::kSyncStallTimeoutUs)) {
+        sync_fail(SYNC_ERROR_RIGHT_STALL);
+        return;
+    }
+    sync_state.left_start_boost_active = speeds.left_boost_active;
+    sync_state.right_start_boost_active = speeds.right_boost_active;
+    double left_speed_abs = speeds.left_abs;
+    double right_speed_abs = speeds.right_abs;
     double left_physical_speed = sync_state.left_dir_sign * left_speed_abs;
     double right_physical_speed = sync_state.right_dir_sign * right_speed_abs;
     double left_internal_cmd = -left_physical_speed;
@@ -838,6 +841,19 @@ static void print_sync_status() {
                dr);
         return;
     }
+    if (sync_state.error != SYNC_ERROR_NONE && sync_state.ever_started) {
+        printf("SYNC_STATUS state=ERROR error=%s target=%.3f "
+               "left=%.3f right=%.3f raw_l=%d raw_r=%d dl=%d dr=%d\n",
+               sync_error_string(sync_state.error),
+               sync_state.target_abs_deg,
+               sync_state.last_left_progress_deg,
+               sync_state.last_right_progress_deg,
+               raw_l,
+               raw_r,
+               dl,
+               dr);
+        return;
+    }
     if (have_encoder_counts) {
         printf("SYNC_STATUS state=IDLE raw_l=%d raw_r=%d\n", raw_l, raw_r);
         return;
@@ -852,9 +868,13 @@ static void handle_motors_sync_rot(char* rest) {
     char right_dir_token[16];
     int left_dir_sign = 0;
     int right_dir_sign = 0;
-    if (sscanf(rest, "%lf %15s %15s %lf",
-               &abs_deg, left_dir_token, right_dir_token, &speed_deg_s) != 4) {
-        force_motor_outputs_low();
+    int consumed = 0;
+    if (sscanf(rest, "%lf %15s %15s %lf %n",
+               &abs_deg, left_dir_token, right_dir_token,
+               &speed_deg_s, &consumed) != 4 ||
+        !only_spaces(rest + consumed) ||
+        !std::isfinite(abs_deg) || !std::isfinite(speed_deg_s)) {
+        safe_all();
         printf("ERR INVALID_SYNC_TARGET\n");
         fflush(stdout);
         set_led_char('E');
@@ -917,7 +937,8 @@ static void handle_motors_sync_rot(char* rest) {
     sync_state.target_abs_deg = abs_deg;
     sync_state.left_dir_sign = left_dir_sign;
     sync_state.right_dir_sign = right_dir_sign;
-    sync_state.base_speed_deg_s = clamp_double(speed_deg_s, 0.0, SYNC_MAX_SPEED_DEG_S);
+    sync_state.base_speed_deg_s =
+        clamp_double(speed_deg_s, 0.0, firmware::kSyncMaxSpeedDegS);
     sync_state.last_left_progress_deg = 0.0;
     sync_state.last_right_progress_deg = 0.0;
     sync_state.last_error_deg = 0.0;
@@ -930,12 +951,31 @@ static void handle_motors_sync_rot(char* rest) {
     sync_state.left_start_boost_active = sync_state.start_boost_enabled;
     sync_state.right_start_boost_active = sync_state.start_boost_enabled;
     sync_state.start_boost_start_us = 0;
+    sync_state.error = SYNC_ERROR_NONE;
+    sync_state.error_report_pending = false;
 
-    restore_motor_pwm_outputs();
+    if (!restore_motor_pwm_outputs()) {
+        sync_start_initializing = false;
+        safe_all();
+        printf("ERR MOTOR_PWM_RESTORE_FAILED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
     motor0->resetControlState();
     motor1->resetControlState();
-    sync_state.start_boost_start_us = time_us_64();
+    uint64_t start_us = time_us_64();
+    sync_state.start_boost_start_us = start_us;
+    sync_state.operation_start_us = start_us;
+    sync_state.total_timeout_us =
+        firmware::calculate_sync_total_timeout_us(abs_deg, speed_deg_s);
+    sync_state.left_last_progress_us = start_us;
+    sync_state.right_last_progress_us = start_us;
+    sync_state.left_last_raw_count = sync_state.left_start_count;
+    sync_state.right_last_raw_count = sync_state.right_start_count;
     sync_state.active = true;
+    motor_motion_command_active[0] = true;
+    motor_motion_command_active[1] = true;
     sync_start_initializing = false;
     sync_update();
 
@@ -951,6 +991,7 @@ static void handle_motors_sync_rot(char* rest) {
 static void handle_gpio_read(char* rest) {
     int gpio = -1;
     if (!parse_one_int(rest, &gpio)) {
+        safe_all();
         printf("ERR INVALID_GPIO\n");
         fflush(stdout);
         set_led_char('E');
@@ -972,6 +1013,7 @@ static void handle_gpio_read(char* rest) {
 static void handle_gpio_high(char* rest) {
     int gpio = -1;
     if (!parse_one_int(rest, &gpio)) {
+        safe_all();
         printf("ERR INVALID_GPIO\n");
         fflush(stdout);
         set_led_char('E');
@@ -996,6 +1038,7 @@ static void handle_gpio_high(char* rest) {
 static void handle_gpio_low(char* rest) {
     int gpio = -1;
     if (!parse_one_int(rest, &gpio)) {
+        safe_all();
         printf("ERR INVALID_GPIO\n");
         fflush(stdout);
         set_led_char('E');
@@ -1015,6 +1058,7 @@ static void handle_gpio_pulse(char* rest) {
     int gpio = -1;
     int ms = 0;
     if (!parse_two_ints(rest, &gpio, &ms)) {
+        safe_all();
         printf("ERR INVALID_GPIO\n");
         fflush(stdout);
         set_led_char('E');
@@ -1050,6 +1094,7 @@ static void handle_pwm_test(char* rest) {
     int duty_percent = 0;
     int ms = 0;
     if (!parse_three_ints(rest, &gpio, &duty_percent, &ms)) {
+        safe_all();
         printf("ERR INVALID_GPIO\n");
         fflush(stdout);
         set_led_char('E');
@@ -1074,9 +1119,25 @@ static void handle_pwm_test(char* rest) {
     gpio_set_function(gpio, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(gpio);
     uint channel = pwm_gpio_to_channel(gpio);
-    pwm_set_clkdiv(slice, (float)125E6 / (2048 * DIAG_PWM_FREQ));
-    pwm_set_wrap(slice, 2047);
-    pwm_set_chan_level(slice, channel, (uint16_t)(2047 * duty_percent / 100));
+    firmware::PwmTiming timing =
+        firmware::calculate_pwm_timing(
+            clock_get_hz(clk_sys), DIAG_PWM_FREQ);
+    if (!timing.valid) {
+        gpio_init(gpio);
+        gpio_set_dir(gpio, GPIO_OUT);
+        gpio_put(gpio, 0);
+        printf("ERR PWM_CONFIG\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    pwm_set_clkdiv_int_frac(
+        slice, timing.divider_integer, timing.divider_fraction_16);
+    pwm_set_wrap(slice, timing.wrap);
+    pwm_set_chan_level(
+        slice, channel,
+        static_cast<uint16_t>(
+            static_cast<uint32_t>(timing.wrap) * duty_percent / 100));
     pwm_set_enabled(slice, true);
     diag_pwm[gpio] = true;
     diag_high[gpio] = false;
@@ -1090,6 +1151,7 @@ static void handle_pwm_test(char* rest) {
 static void handle_pwm_off(char* rest) {
     int gpio = -1;
     if (!parse_one_int(rest, &gpio)) {
+        safe_all();
         printf("ERR INVALID_GPIO\n");
         fflush(stdout);
         set_led_char('E');
@@ -1126,13 +1188,24 @@ static bool timer_cb_pos(repeating_timer_t* rt) {
     return timer_started;
 }
 
-static void start_motor_timers() {
+static bool start_motor_timers() {
     if (timer_started) {
-        return;
+        return true;
     }
-    add_repeating_timer_ms(-10, timer_cb, NULL, &velocity_timer);
-    add_repeating_timer_ms(-100, timer_cb_pos, NULL, &position_timer);
+    bool velocity_ok =
+        add_repeating_timer_ms(-10, timer_cb, NULL, &velocity_timer);
+    if (!velocity_ok) {
+        return false;
+    }
+    bool position_ok =
+        add_repeating_timer_ms(-100, timer_cb_pos, NULL, &position_timer);
+    if (!firmware::timer_registration_succeeded(
+            velocity_ok, position_ok)) {
+        cancel_repeating_timer(&velocity_timer);
+        return false;
+    }
     timer_started = true;
+    return true;
 }
 
 static void stop_motor_timers() {
@@ -1152,6 +1225,8 @@ static void stop_motors_if_enabled() {
     sync_cancel(false);
     motor0->resetControlState();
     motor1->resetControlState();
+    motor_motion_command_active[0] = false;
+    motor_motion_command_active[1] = false;
     force_motor_outputs_low();
 }
 
@@ -1167,11 +1242,14 @@ static void configure_motor_gains() {
 
 static bool enable_motors() {
     force_motor_outputs_low();
+    motor_enable_error = "NONE";
     if (motors_pin_conflict()) {
+        motor_enable_error = "PIN_CONFLICT";
         force_motor_outputs_low();
         return false;
     }
     if (!create_motor_objects_if_needed()) {
+        motor_enable_error = "ALLOCATION_FAILED";
         force_motor_outputs_low();
         return false;
     }
@@ -1184,6 +1262,12 @@ static bool enable_motors() {
         gpio_set_dir(MOTOR_QENC1_GPIO + 1, GPIO_IN);
         motor0->init();
         motor1->init();
+        if (!pwm0->isInitialized() || !pwm1->isInitialized() ||
+            !pwm2->isInitialized() || !pwm3->isInitialized()) {
+            motor_enable_error = "PWM_CONFIG_FAILED";
+            force_motor_outputs_low();
+            return false;
+        }
         configure_motor_gains();
         motors_initialized = true;
     } else {
@@ -1194,16 +1278,28 @@ static bool enable_motors() {
     stop_motors_if_enabled();
     motor0->resetControlState();
     motor1->resetControlState();
-    start_motor_timers();
+    if (!start_motor_timers()) {
+        motor_enable_error = "TIMER_START_FAILED";
+        motors_runtime_enabled = false;
+        stop_motor_timers();
+        motor0->resetControlState();
+        motor1->resetControlState();
+        force_motor_outputs_low();
+        return false;
+    }
     force_motor_outputs_low();
     return true;
 }
 
 static void disable_motors() {
-    sync_cancel(true);
-    stop_motors_if_enabled();
+    // Prevent both callbacks from re-entering motor control while control state
+    // and pin muxes are being returned to the physical LOW safe state.
     motors_runtime_enabled = false;
     stop_motor_timers();
+    sync_cancel(true);
+    stop_motors_if_enabled();
+    motor_motion_command_active[0] = false;
+    motor_motion_command_active[1] = false;
     force_motor_outputs_low();
 }
 
@@ -1211,32 +1307,49 @@ static bool enable_servo() {
     if (servo_pin_conflict()) {
         return false;
     }
-    if (!servo_initialized) {
-        servo.init();
-        servo_initialized = true;
+    if (servo_runtime_enabled) {
+        return true;
+    }
+    if (!servo_output.enable()) {
+        servo_runtime_enabled = false;
+        return false;
     }
     servo_runtime_enabled = true;
     return true;
 }
 
 static void disable_servo() {
+    servo_output.disable();
     servo_runtime_enabled = false;
 }
 
-static void safe_all() {
-    sync_cancel(true);
-    stop_motors_if_enabled();
-    motors_runtime_enabled = false;
-    force_motor_outputs_low();
+static void safe_stop_motors_callback() {
     disable_motors();
+}
+
+static void safe_stop_servo_callback() {
     disable_servo();
+}
+
+static void safe_stop_diagnostics_callback() {
     diag_all_low();
+}
+
+static void safe_all() {
+    firmware::SafeStopCallbacks callbacks = {
+        safe_stop_motors_callback,
+        safe_stop_servo_callback,
+        safe_stop_diagnostics_callback};
+    firmware::invoke_safe_stop(callbacks);
+    motor_motion_command_active[0] = false;
+    motor_motion_command_active[1] = false;
     force_motor_outputs_low();
 }
 
 static void print_status() {
     printf("FW=NORMAL UART_ID=%d TX=%d RX=%d BAUD=%d "
-           "MOTORS_ENABLED=%d SERVO_ENABLED=%d TIMER_STARTED=%d "
+           "MOTORS_ENABLED=%d SERVO_ENABLED=%d SERVO_PULSING=%d "
+           "SERVO_PULSE_US=%u SERVO_PIO_SM=%d TIMER_STARTED=%d "
            "PWM=%d,%d,%d,%d SERVO_GPIO=%d QENC=%d,%d LED=%c PIN_CONFLICT=",
            MOTOR_UART_ID,
            MOTOR_UART_TX_GPIO,
@@ -1244,6 +1357,9 @@ static void print_status() {
            MOTOR_UART_BAUDRATE,
            motors_runtime_enabled ? 1 : 0,
            servo_runtime_enabled ? 1 : 0,
+           servo_output.is_pulsing() ? 1 : 0,
+           servo_output.applied_pulse_us(),
+           servo_output.state_machine(),
            timer_started ? 1 : 0,
            MOTOR_PWM0_GPIO,
            MOTOR_PWM1_GPIO,
@@ -1268,8 +1384,8 @@ static void print_encoder_status() {
         return;
     }
 
-    // Physical left/right mapping is provisional: enc[0]=left, enc[1]=right.
-    printf("ENCODER left=%d right=%d\n", enc[0].get(), enc[1].get());
+    // Keep this aligned with the physical sync API mapping below.
+    printf("ENCODER left=%d right=%d\n", enc[1].get(), enc[0].get());
     fflush(stdout);
 }
 
@@ -1282,10 +1398,22 @@ static void print_help() {
            "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
            "DIAG_ALL_LOW, motor commands\n");
     printf("MOTOR: <id> <mode> <val>\n");
-    printf("SERVO: 2 <mode> <angle_deg>\n");
+    printf("SERVO: 2 0 <pulse_command_deg 0..180>; "
+           "90 is provisional neutral, not physical angle\n");
     printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
     printf("MOTORS_SYNC_ROT: left/right are physical wheels; "
            "left=motor1/enc1 right=motor0/enc0; + is CCW from rover side\n");
+}
+
+static bool reject_unexpected_args(const char* command, char* rest) {
+    if (only_spaces(rest)) {
+        return false;
+    }
+    safe_all();
+    set_led_char('E');
+    printf("ERR %s_ARGS\n", command);
+    fflush(stdout);
+    return true;
 }
 
 static bool handle_text_command(char* line) {
@@ -1298,6 +1426,7 @@ static bool handle_text_command(char* line) {
     if (strcmp(command, "LED") == 0) {
         rest = skip_spaces(rest);
         if (*rest == 0) {
+            safe_all();
             set_led_char('I');
             printf("ERR LED missing\n");
             fflush(stdout);
@@ -1305,7 +1434,16 @@ static bool handle_text_command(char* line) {
         }
 
         char led_char = (char)toupper((unsigned char)*rest);
+        char* led_tail = rest + 1;
+        if (!only_spaces(led_tail)) {
+            safe_all();
+            set_led_char('E');
+            printf("ERR LED_ARGS\n");
+            fflush(stdout);
+            return true;
+        }
         if (!set_led_char(led_char)) {
+            safe_all();
             set_led_char('I');
             printf("ERR LED unsupported char=%c\n", led_char);
             fflush(stdout);
@@ -1318,6 +1456,9 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "PING") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         set_led_char('P');
         printf("PONG\n");
         fflush(stdout);
@@ -1325,18 +1466,27 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "STATUS") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         print_status();
         fflush(stdout);
         return true;
     }
 
     if (strcmp(command, "HELP") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         print_help();
         fflush(stdout);
         return true;
     }
 
     if (strcmp(command, "PIN_STATUS") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         print_pin_status();
         fflush(stdout);
         set_led_char('D');
@@ -1345,6 +1495,7 @@ static bool handle_text_command(char* line) {
 
     if (strcmp(command, "ENCODER") == 0) {
         if (*skip_spaces(rest) != 0) {
+            safe_all();
             printf("ERR ENCODER_ARGS\n");
             fflush(stdout);
             set_led_char('E');
@@ -1385,6 +1536,9 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "DIAG_ALL_LOW") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         if (!diag_runtime_available()) {
             return true;
         }
@@ -1401,12 +1555,18 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "MOTORS_SYNC_STATUS") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         print_sync_status();
         fflush(stdout);
         return true;
     }
 
     if (strcmp(command, "MOTORS_SYNC_CANCEL") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         sync_cancel(true);
         set_led_char('S');
         printf("OK MOTORS_SYNC_CANCEL\n");
@@ -1415,6 +1575,9 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "STOP") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         stop_motors_if_enabled();
         set_led_char('S');
         printf("OK STOP\n");
@@ -1423,6 +1586,9 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "SAFE") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         safe_all();
         set_led_char('S');
         printf("OK SAFE\n");
@@ -1431,9 +1597,12 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "MOTOR_ENABLE") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         if (!enable_motors()) {
             set_led_char('E');
-            printf("ERR PIN_CONFLICT MOTORS\n");
+            printf("ERR MOTOR_ENABLE %s\n", motor_enable_error);
             fflush(stdout);
             return true;
         }
@@ -1444,6 +1613,9 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "MOTOR_DISABLE") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         disable_motors();
         set_led_char('S');
         printf("OK MOTOR_DISABLE\n");
@@ -1452,9 +1624,15 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "SERVO_ENABLE") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         if (!enable_servo()) {
             set_led_char('E');
-            printf("ERR PIN_CONFLICT SERVO\n");
+            printf("ERR SERVO_ENABLE %s\n",
+                   servo_pin_conflict()
+                       ? "PIN_CONFLICT"
+                       : servo_output.last_error());
             fflush(stdout);
             return true;
         }
@@ -1465,6 +1643,9 @@ static bool handle_text_command(char* line) {
     }
 
     if (strcmp(command, "SERVO_DISABLE") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
         disable_servo();
         set_led_char('S');
         printf("OK SERVO_DISABLE\n");
@@ -1475,12 +1656,67 @@ static bool handle_text_command(char* line) {
     return false;
 }
 
-static bool readline(char* line, int line_size) {
+static void service_runtime_safety() {
+    if (sync_state.error_report_pending) {
+        SyncError error = sync_state.error;
+        sync_state.error_report_pending = false;
+        set_led_char('E');
+        printf("ERR SYNC_%s\n", sync_error_string(error));
+        fflush(stdout);
+    }
+
+    if (servo_output.has_feed_fault()) {
+        safe_all();
+        set_led_char('E');
+        printf("ERR SERVO_PIO_FEED_FAILED\n");
+        fflush(stdout);
+        return;
+    }
+
+    bool motion_active =
+        motor_motion_command_active[0] ||
+        motor_motion_command_active[1] ||
+        sync_state.active ||
+        servo_output.is_pulsing();
+    uint64_t now_us = time_us_64();
+    if (motion_active &&
+        firmware::deadline_expired(
+            now_us,
+            last_complete_command_us,
+            firmware::kCommandWatchdogTimeoutUs)) {
+        safe_all();
+        watchdog_report_pending = true;
+    }
+    if (watchdog_report_pending) {
+        watchdog_report_pending = false;
+        set_led_char('E');
+        printf("ERR COMMAND_WATCHDOG_TIMEOUT\n");
+        fflush(stdout);
+    }
+}
+
+enum ReadLineResult {
+    READ_LINE_OK = 0,
+    READ_LINE_TOO_LONG,
+    READ_LINE_TIMEOUT,
+};
+
+static ReadLineResult readline(char* line, int line_size) {
     int i = 0;
+    uint64_t partial_line_start_us = 0;
     while (true) {
         int c_raw = getchar_timeout_us(LOOP_ALIVE_SERVICE_US);
         service_led();
+        service_runtime_safety();
         if (c_raw == PICO_ERROR_TIMEOUT) {
+            if (partial_line_start_us != 0 &&
+                firmware::deadline_expired(
+                    time_us_64(),
+                    partial_line_start_us,
+                    firmware::kUartPartialLineTimeoutUs)) {
+                line[i] = 0;
+                return READ_LINE_TIMEOUT;
+            }
             continue;
         }
 
@@ -1491,67 +1727,88 @@ static bool readline(char* line, int line_size) {
         if (c == '\r') {
             continue;
         }
+        if (partial_line_start_us == 0) {
+            partial_line_start_us = time_us_64();
+        }
         if (i >= line_size - 1) {
             line[line_size - 1] = 0;
             while (c != '\n') {
                 c_raw = getchar_timeout_us(LOOP_ALIVE_SERVICE_US);
                 service_led();
+                service_runtime_safety();
                 if (c_raw == PICO_ERROR_TIMEOUT) {
+                    if (firmware::deadline_expired(
+                            time_us_64(),
+                            partial_line_start_us,
+                            firmware::kUartPartialLineTimeoutUs)) {
+                        return READ_LINE_TIMEOUT;
+                    }
                     continue;
                 }
                 c = (char)c_raw;
             }
-            return false;
+            return READ_LINE_TOO_LONG;
         }
         line[i++] = c;
     }
     line[i] = 0;
-    return true;
+    return READ_LINE_OK;
 }
 
 int main() {
     force_motor_outputs_low();
+    servo_output.disable();
     init_led();
     init_uart_stdio();
     set_led_char('L');
     printf("FW NORMAL SAFE BOOT\n");
     log_uart_config();
+    last_complete_command_us = time_us_64();
 
     while (true) {
         service_led();
-        if (!readline(buf, sizeof(buf))) {
-            force_motor_outputs_low();
+        ReadLineResult read_result = readline(buf, sizeof(buf));
+        if (read_result != READ_LINE_OK) {
+            safe_all();
             set_led_char('E');
-            printf("ERR line_too_long\n");
+            printf("ERR %s\n",
+                   read_result == READ_LINE_TOO_LONG
+                       ? "LINE_TOO_LONG"
+                       : "PARTIAL_LINE_TIMEOUT");
             fflush(stdout);
             continue;
         }
 
+        last_complete_command_us = time_us_64();
         set_led_char('R');
         log_received_line(buf);
         if (handle_text_command(buf)) {
             continue;
         }
 
-        int id = 0;
-        int mode = 0;
-        double val = 0.0;
-        int parsed = sscanf(buf, "%d %d %lf", &id, &mode, &val);
-        printf("DBG parse n=%d id=%d mode=%d val=%.3f\n", parsed, id, mode, val);
-        fflush(stdout);
-        if (parsed != 3) {
-            force_motor_outputs_low();
+        firmware::NumericCommand command = {};
+        firmware::NumericParseError parse_error =
+            firmware::NumericParseError::kNone;
+        if (!firmware::parse_numeric_command(
+                buf, &command, &parse_error)) {
+            safe_all();
             set_led_char('E');
-            printf("ERR parse raw=\"%s\"\n", buf);
+            printf("ERR PARSE_%s raw=\"%s\"\n",
+                   firmware::numeric_parse_error_string(parse_error),
+                   buf);
             fflush(stdout);
             continue;
         }
 
+        int id = command.id;
+        int mode = command.mode;
+        double val = command.value;
+        printf("DBG parse n=3 id=%d mode=%d val=%.3f\n", id, mode, val);
         printf("DBG dispatch id=%d mode=%d val=%.3f\n", id, mode, val);
         fflush(stdout);
 
         if (id < 0 || id > 2) {
-            force_motor_outputs_low();
+            safe_all();
             set_led_char('I');
             printf("ERR id out_of_range id=%d\n", id);
             fflush(stdout);
@@ -1580,16 +1837,34 @@ int main() {
             continue;
         }
         if ((id == 0 || id == 1) && mode != 0 && mode != 1) {
-            force_motor_outputs_low();
+            safe_all();
             set_led_char('I');
             printf("ERR mode invalid id=%d mode=%d\n", id, mode);
             fflush(stdout);
             continue;
         }
+        if (id == 2) {
+            firmware::ServoCommandError servo_error =
+                firmware::validate_servo_command(mode, val);
+            if (servo_error != firmware::ServoCommandError::kNone) {
+                set_led_char('E');
+                printf("ERR SERVO_%s\n",
+                       firmware::servo_command_error_string(servo_error));
+                fflush(stdout);
+                continue;
+            }
+        }
 
         switch (id) {
             case 0:
-                restore_motor_pwm_outputs();
+                sync_cancel(false);
+                if (!restore_motor_pwm_outputs()) {
+                    safe_all();
+                    set_led_char('E');
+                    printf("ERR MOTOR_PWM_RESTORE_FAILED\n");
+                    fflush(stdout);
+                    continue;
+                }
                 if (!mode) {
                     motor0->disablePosPid();
                     motor0->setVel(val);
@@ -1599,9 +1874,18 @@ int main() {
                     motor0->setPos(val);
                     printf("OK motor id=0 mode=pos target=%.3f\n", val);
                 }
+                motor_motion_command_active[0] =
+                    mode != 0 || val != 0.0;
                 break;
             case 1:
-                restore_motor_pwm_outputs();
+                sync_cancel(false);
+                if (!restore_motor_pwm_outputs()) {
+                    safe_all();
+                    set_led_char('E');
+                    printf("ERR MOTOR_PWM_RESTORE_FAILED\n");
+                    fflush(stdout);
+                    continue;
+                }
                 if (!mode) {
                     motor1->disablePosPid();
                     motor1->setVel(val);
@@ -1611,11 +1895,36 @@ int main() {
                     motor1->setPos(val);
                     printf("OK motor id=1 mode=pos target=%.3f\n", val);
                 }
+                motor_motion_command_active[1] =
+                    mode != 0 || val != 0.0;
                 break;
-            case 2:
-                servo.write((int)val);
-                printf("OK servo id=2 mode=%d angle=%d\n", mode, (int)val);
+            case 2: {
+                uint32_t pulse_us =
+                    firmware::servo_command_to_pulse_us(val);
+                if (!servo_output.write_pulse_us(pulse_us)) {
+                    const char* error = servo_output.last_error();
+                    safe_all();
+                    set_led_char('E');
+                    printf("ERR SERVO_OUTPUT %s\n", error);
+                    fflush(stdout);
+                    continue;
+                }
+                char acknowledgement[96];
+                if (!firmware::format_servo_ack(
+                        acknowledgement,
+                        sizeof(acknowledgement),
+                        mode,
+                        val,
+                        servo_output.applied_pulse_us())) {
+                    safe_all();
+                    set_led_char('E');
+                    printf("ERR SERVO_ACK_FORMAT\n");
+                    fflush(stdout);
+                    continue;
+                }
+                printf("%s\n", acknowledgement);
                 break;
+            }
         }
         set_led_char('T');
         fflush(stdout);

@@ -1,120 +1,11 @@
+#include "firmware_logic.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 
-static const double SYNC_KP = 0.30;
-static const double SYNC_TOLERANCE_DEG = 3.0;
-static const double SYNC_TOLERANCE_RATIO = 0.20;
-static const double SYNC_MIN_SPEED_DEG_S = 20.0;
-static const double SYNC_SMALL_TARGET_MIN_SPEED_DEG_S = 30.0;
-static const double SYNC_SMALL_TARGET_MAX_DEG = 15.0;
-static const double SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S = 80.0;
-static const uint64_t SYNC_SMALL_TARGET_START_BOOST_MAX_US = 300000;
-static const int SYNC_START_BOOST_PROGRESS_COUNTS = 1;
-static const double SYNC_MAX_SPEED_DEG_S = 180.0;
-static const double SYNC_SLOWDOWN_GAIN = 1.2;
-
-static double clamp_double(double value, double min_value, double max_value) {
-    if (value < min_value) {
-        return min_value;
-    }
-    if (value > max_value) {
-        return max_value;
-    }
-    return value;
-}
-
-static double min_double(double a, double b) {
-    return a < b ? a : b;
-}
-
-static double max_double(double a, double b) {
-    return a > b ? a : b;
-}
-
-static double calculate_sync_tolerance_deg(double target_abs_deg) {
-    if (target_abs_deg <= 0.0) {
-        return 0.0;
-    }
-    return min_double(SYNC_TOLERANCE_DEG,
-                      target_abs_deg * SYNC_TOLERANCE_RATIO);
-}
-
-static double calculate_sync_done_threshold_deg(double target_abs_deg) {
-    double tolerance_deg = calculate_sync_tolerance_deg(target_abs_deg);
-    return max_double(0.0, target_abs_deg - tolerance_deg);
-}
-
-static double calculate_sync_min_speed_deg_s(double target_abs_deg) {
-    if (target_abs_deg <= SYNC_SMALL_TARGET_MAX_DEG) {
-        return SYNC_SMALL_TARGET_MIN_SPEED_DEG_S;
-    }
-    return SYNC_MIN_SPEED_DEG_S;
-}
-
-static bool sync_start_boost_target_enabled(double target_abs_deg) {
-    return target_abs_deg <= SYNC_SMALL_TARGET_MAX_DEG;
-}
-
-static bool sync_start_boost_wheel_active(bool boost_enabled,
-                                          bool boost_active,
-                                          int directed_progress_count,
-                                          double remaining_deg,
-                                          double tolerance_deg,
-                                          uint64_t elapsed_us) {
-    if (!boost_enabled || !boost_active) {
-        return false;
-    }
-    if (remaining_deg <= tolerance_deg) {
-        return false;
-    }
-    if (directed_progress_count >= SYNC_START_BOOST_PROGRESS_COUNTS) {
-        return false;
-    }
-    if (elapsed_us >= SYNC_SMALL_TARGET_START_BOOST_MAX_US) {
-        return false;
-    }
-    return true;
-}
-
-static double calculate_sync_wheel_base_speed(double remaining_deg,
-                                              double requested_speed_deg_s,
-                                              double tolerance_deg,
-                                              double min_speed_deg_s) {
-    if (remaining_deg <= tolerance_deg) {
-        return 0.0;
-    }
-
-    double base_speed =
-        min_double(requested_speed_deg_s, SYNC_SLOWDOWN_GAIN * remaining_deg);
-    if (base_speed < 0.0) {
-        base_speed = 0.0;
-    }
-    if (base_speed < min_speed_deg_s) {
-        base_speed = min_speed_deg_s;
-    }
-    return clamp_double(base_speed, 0.0, SYNC_MAX_SPEED_DEG_S);
-}
-
-static double apply_sync_start_boost(double base_speed_deg_s, bool boost_active) {
-    if (boost_active && base_speed_deg_s < SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S) {
-        return SYNC_SMALL_TARGET_START_BOOST_SPEED_DEG_S;
-    }
-    return base_speed_deg_s;
-}
-
-struct SpeedResult {
-    double left_abs;
-    double right_abs;
-    bool done;
-    double tolerance;
-    double threshold;
-    double min_speed;
-    bool boost_eligible;
-    bool left_boost_active;
-    bool right_boost_active;
-};
+using SpeedResult = firmware::SyncSpeedResult;
 
 static SpeedResult calculate_sync_speeds(double target,
                                          double left_progress,
@@ -125,54 +16,16 @@ static SpeedResult calculate_sync_speeds(double target,
                                          int left_directed_progress_count = 0,
                                          int right_directed_progress_count = 0,
                                          uint64_t elapsed_us = 0) {
-    SpeedResult result = {};
-    result.tolerance = calculate_sync_tolerance_deg(target);
-    result.threshold = calculate_sync_done_threshold_deg(target);
-    result.min_speed = calculate_sync_min_speed_deg_s(target);
-    result.boost_eligible = sync_start_boost_target_enabled(target);
-    result.done = left_progress >= result.threshold &&
-                  right_progress >= result.threshold;
-    if (result.done) {
-        return result;
-    }
-
-    double left_remaining = target - left_progress;
-    double right_remaining = target - right_progress;
-    result.left_boost_active =
-        sync_start_boost_wheel_active(result.boost_eligible,
-                                      left_boost_input,
-                                      left_directed_progress_count,
-                                      left_remaining,
-                                      result.tolerance,
-                                      elapsed_us);
-    result.right_boost_active =
-        sync_start_boost_wheel_active(result.boost_eligible,
-                                      right_boost_input,
-                                      right_directed_progress_count,
-                                      right_remaining,
-                                      result.tolerance,
-                                      elapsed_us);
-
-    double requested = clamp_double(requested_speed, 0.0, SYNC_MAX_SPEED_DEG_S);
-    double left_base =
-        calculate_sync_wheel_base_speed(
-            left_remaining, requested, result.tolerance, result.min_speed);
-    double right_base =
-        calculate_sync_wheel_base_speed(
-            right_remaining, requested, result.tolerance, result.min_speed);
-    left_base = apply_sync_start_boost(left_base, result.left_boost_active);
-    right_base = apply_sync_start_boost(right_base, result.right_boost_active);
-    double correction = SYNC_KP * (left_progress - right_progress);
-
-    result.left_abs = clamp_double(left_base - correction, 0.0, SYNC_MAX_SPEED_DEG_S);
-    result.right_abs = clamp_double(right_base + correction, 0.0, SYNC_MAX_SPEED_DEG_S);
-    if (left_remaining <= result.tolerance) {
-        result.left_abs = 0.0;
-    }
-    if (right_remaining <= result.tolerance) {
-        result.right_abs = 0.0;
-    }
-    return result;
+    return firmware::calculate_sync_speeds(
+        target,
+        left_progress,
+        right_progress,
+        requested_speed,
+        left_boost_input,
+        right_boost_input,
+        left_directed_progress_count,
+        right_directed_progress_count,
+        elapsed_us);
 }
 
 static void expect_close(const char* name, double actual, double expected) {
@@ -215,9 +68,12 @@ static void expect_min_speed(double target, double expected_min_speed) {
 }
 
 int main() {
-    expect_close("zero target tolerance", calculate_sync_tolerance_deg(0.0), 0.0);
-    expect_close("negative target tolerance", calculate_sync_tolerance_deg(-1.0), 0.0);
-    expect_close("max tolerance", calculate_sync_tolerance_deg(409.256), 3.0);
+    expect_close("zero target tolerance",
+                 firmware::calculate_sync_tolerance_deg(0.0), 0.0);
+    expect_close("negative target tolerance",
+                 firmware::calculate_sync_tolerance_deg(-1.0), 0.0);
+    expect_close("max tolerance",
+                 firmware::calculate_sync_tolerance_deg(409.256), 3.0);
 
     expect_boundary(1.0, 0.2, 0.8);
     expect_boundary(2.0, 0.4, 1.6);
@@ -384,12 +240,16 @@ int main() {
     expect_close("target 30 boost input ignored right", r.right_abs, 36.0);
 
     r = calculate_sync_speeds(180.0, 0.0, 0.0, 300.0);
-    expect_close("target 180 initial left", r.left_abs, SYNC_MAX_SPEED_DEG_S);
-    expect_close("target 180 initial right", r.right_abs, SYNC_MAX_SPEED_DEG_S);
+    expect_close("target 180 initial left",
+                 r.left_abs, firmware::kSyncMaxSpeedDegS);
+    expect_close("target 180 initial right",
+                 r.right_abs, firmware::kSyncMaxSpeedDegS);
 
     r = calculate_sync_speeds(409.256, 0.0, 0.0, 300.0);
-    expect_close("long target max left", r.left_abs, SYNC_MAX_SPEED_DEG_S);
-    expect_close("long target max right", r.right_abs, SYNC_MAX_SPEED_DEG_S);
+    expect_close("long target max left",
+                 r.left_abs, firmware::kSyncMaxSpeedDegS);
+    expect_close("long target max right",
+                 r.right_abs, firmware::kSyncMaxSpeedDegS);
 
     r = calculate_sync_speeds(5.0, 6.0, 0.0, 180.0);
     expect_close("left overshoot", r.left_abs, 0.0);
@@ -400,7 +260,8 @@ int main() {
     expect_close("right overshoot", r.right_abs, 0.0);
 
     r = calculate_sync_speeds(409.256, -500.0, 0.0, 180.0);
-    expect_close("correction clamp left", r.left_abs, SYNC_MAX_SPEED_DEG_S);
+    expect_close("correction clamp left",
+                 r.left_abs, firmware::kSyncMaxSpeedDegS);
     expect_close("correction clamp right", r.right_abs, 30.0);
 
     SpeedResult positive_profile = calculate_sync_speeds(5.0, 0.0, 4.8, 180.0);
@@ -415,7 +276,7 @@ int main() {
     r = calculate_sync_speeds(5.0, 2.031, 4.8, 180.0);
     expect_false("old tolerance no longer done", r.done);
     expect_true("old tolerance left keeps moving",
-                r.left_abs >= SYNC_SMALL_TARGET_MIN_SPEED_DEG_S);
+                r.left_abs >= firmware::kSyncSmallTargetMinSpeedDegS);
 
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 10.0);
     expect_close("small target min beats requested left", r.left_abs, 30.0);

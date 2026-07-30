@@ -89,18 +89,26 @@ message(STATUS "rpico-motor-driver PICO_BOARD=${PICO_BOARD}")
 
 add_executable(rpico-motor-driver
           rpico-motor-driver.cpp
+          firmware_logic.cpp
+          pio_servo_output.cpp
           ./lib/rpico-pwm/pwm.cpp
           ./lib/rpico-encoder-plus/qenc.cpp
           ./lib/rpico-motor/motor.cpp
           ./lib/generic-pid/pid.cpp
-          ./lib/rpico-servo/servo.cpp
           )
+
+set_target_properties(rpico-motor-driver PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+        )
 
 pico_set_program_name(rpico-motor-driver "rpico-motor-driver")
 pico_set_program_version(rpico-motor-driver "0.3-xiao-rp2350-safe-diag")
 
 # Generate PIO header
 pico_generate_pio_header(rpico-motor-driver ${CMAKE_CURRENT_LIST_DIR}/encoder.pio)
+pico_generate_pio_header(rpico-motor-driver ${CMAKE_CURRENT_LIST_DIR}/servo_pulse.pio)
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(rpico-motor-driver 1)
@@ -134,13 +142,13 @@ message(STATUS "rpico-motor-driver MOTOR_QENC=${MOTOR_QENC0_GPIO},${MOTOR_QENC1_
 target_link_libraries(rpico-motor-driver
         pico_stdlib
         pico_stdio_uart
+        hardware_clocks
         hardware_pwm
         )
 
 # Add the standard include files to the build
 target_include_directories(rpico-motor-driver PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}
-  ${CMAKE_CURRENT_LIST_DIR}/.. # for our common lwipopts or any other standard includes, if required
 )
 
 # Add any user requested libraries
