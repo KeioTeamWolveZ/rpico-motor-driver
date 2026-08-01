@@ -430,19 +430,6 @@ static char* skip_spaces(char* text) {
     return text;
 }
 
-static char* read_upper_token(char* text, char* token, int token_size) {
-    text = skip_spaces(text);
-    int i = 0;
-    while (*text != 0 && !isspace((unsigned char)*text)) {
-        if (i < token_size - 1) {
-            token[i++] = (char)toupper((unsigned char)*text);
-        }
-        ++text;
-    }
-    token[i] = 0;
-    return text;
-}
-
 static void service_led() {
     uint64_t now_us = time_us_64();
     if (led_next_event_us != 0 && now_us < led_next_event_us) {
@@ -1564,10 +1551,15 @@ static bool reject_unexpected_args(const char* command, char* rest) {
 }
 
 static bool handle_text_command(char* line) {
-    char command[20];
-    char* rest = read_upper_token(line, command, sizeof(command));
+    char command[firmware::kTextCommandTokenBufferSize];
+    firmware::TextCommandToken token =
+        firmware::read_text_command_token(line, command, sizeof(command));
+    char* rest = token.rest;
     if (command[0] == 0) {
         return true;
+    }
+    if (!firmware::is_text_command_token(command)) {
+        return false;
     }
 
     if (strcmp(command, "LED") == 0) {
@@ -1724,7 +1716,7 @@ static bool handle_text_command(char* line) {
             return true;
         }
         clear_sync_fault_detail();
-        printf("OK MOTORS_SYNC_FAULT_CLEAR\n");
+        printf("%s\n", firmware::kMotorsSyncFaultClearAck);
         fflush(stdout);
         return true;
     }

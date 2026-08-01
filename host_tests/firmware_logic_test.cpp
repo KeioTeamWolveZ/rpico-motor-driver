@@ -69,6 +69,9 @@ void stop_diagnostics() {
     ++stop_diag_calls;
 }
 
+firmware::SyncFaultSnapshot sample_sync_fault(
+    firmware::SyncFaultType type);
+
 void test_numeric_parser() {
     firmware::NumericCommand command = {};
     firmware::NumericParseError error =
@@ -112,6 +115,125 @@ void test_numeric_parser() {
     expect_false("reject negative inf",
                  firmware::parse_numeric_command(
                      "2 0 -inf", &command, &error));
+}
+
+void test_text_command_parser() {
+    char token[firmware::kTextCommandTokenBufferSize] = {};
+
+    char status_line[] = "MOTORS_SYNC_FAULT_STATUS";
+    firmware::TextCommandToken status =
+        firmware::read_text_command_token(
+            status_line, token, sizeof(token));
+    expect_false("fault status token not truncated", status.truncated);
+    expect_true("fault status token full",
+                std::strcmp(token, "MOTORS_SYNC_FAULT_STATUS") == 0);
+    expect_true("fault status recognized",
+                firmware::is_text_command_token(token));
+    expect_true("fault status consumes token", *status.rest == '\0');
+
+    firmware::NumericCommand command = {};
+    firmware::NumericParseError error =
+        firmware::NumericParseError::kNone;
+    expect_false("fault status is invalid numeric command",
+                 firmware::parse_numeric_command(
+                     status_line, &command, &error));
+    expect_true("fault status numeric fallback would be invalid id",
+                error == firmware::NumericParseError::kInvalidId);
+
+    char fault_line[1200] = {};
+    firmware::SyncFaultSnapshot none = {};
+    expect_true("fault status none output formats",
+                firmware::format_sync_fault_status(
+                    fault_line, sizeof(fault_line), none));
+    expect_true("fault status none output",
+                std::strcmp(fault_line, "SYNC_FAULT state=NONE") == 0);
+
+    firmware::SyncFaultSnapshot fault =
+        sample_sync_fault(firmware::SyncFaultType::kLeftStall);
+    expect_true("fault status valid output formats",
+                firmware::format_sync_fault_status(
+                    fault_line, sizeof(fault_line), fault));
+    expect_contains("fault status valid output",
+                    fault_line,
+                    "SYNC_FAULT state=VALID");
+
+    char clear_line[] = " motors_sync_fault_clear\r\n";
+    status = firmware::read_text_command_token(
+        clear_line, token, sizeof(token));
+    expect_false("fault clear token not truncated", status.truncated);
+    expect_true("fault clear token full",
+                std::strcmp(token, "MOTORS_SYNC_FAULT_CLEAR") == 0);
+    expect_true("fault clear recognized",
+                firmware::is_text_command_token(token));
+    expect_true("fault clear leaves CRLF tail",
+                std::strcmp(status.rest, "\r\n") == 0);
+    expect_true("fault clear ack stable",
+                std::strcmp(firmware::kMotorsSyncFaultClearAck,
+                            "OK MOTORS_SYNC_FAULT_CLEAR") == 0);
+
+    firmware::SyncFaultSnapshot cleared = {};
+    expect_true("fault clear status formats none",
+                firmware::format_sync_fault_status(
+                    fault_line, sizeof(fault_line), cleared));
+    expect_true("fault clear status none",
+                std::strcmp(fault_line, "SYNC_FAULT state=NONE") == 0);
+
+    char sync_rot_line[] = "MOTORS_SYNC_ROT 21.557 -1 1 180\n";
+    status = firmware::read_text_command_token(
+        sync_rot_line, token, sizeof(token));
+    expect_false("sync rot token not truncated", status.truncated);
+    expect_true("sync rot recognized",
+                firmware::is_text_command_token(token));
+    expect_true("sync rot rest preserved",
+                std::strcmp(status.rest, " 21.557 -1 1 180\n") == 0);
+
+    char safe_line[] = "SAFE";
+    status = firmware::read_text_command_token(
+        safe_line, token, sizeof(token));
+    expect_false("safe token not truncated", status.truncated);
+    expect_true("safe recognized",
+                firmware::is_text_command_token(token));
+
+    char exact_max[firmware::kTextCommandTokenBufferSize] = {};
+    for (std::size_t i = 0;
+         i + 1 < firmware::kTextCommandTokenBufferSize;
+         ++i) {
+        exact_max[i] = 'a';
+    }
+    status = firmware::read_text_command_token(
+        exact_max, token, sizeof(token));
+    expect_false("max token fits without truncation", status.truncated);
+    expect_equal("max token length",
+                 static_cast<long long>(std::strlen(token)),
+                 static_cast<long long>(
+                     firmware::kTextCommandTokenBufferSize - 1));
+    expect_true("max token nul terminated",
+                token[firmware::kTextCommandTokenBufferSize - 1] == '\0');
+    expect_false("max token not recognized by prefix",
+                 firmware::is_text_command_token(token));
+
+    char too_long[firmware::kTextCommandTokenBufferSize + 1] = {};
+    for (std::size_t i = 0; i < firmware::kTextCommandTokenBufferSize; ++i) {
+        too_long[i] = 'b';
+    }
+    status = firmware::read_text_command_token(
+        too_long, token, sizeof(token));
+    expect_true("too long token reports truncation", status.truncated);
+    expect_equal("too long token stored max length",
+                 static_cast<long long>(std::strlen(token)),
+                 static_cast<long long>(
+                     firmware::kTextCommandTokenBufferSize - 1));
+    expect_true("too long token nul terminated",
+                token[firmware::kTextCommandTokenBufferSize - 1] == '\0');
+    expect_false("too long token not recognized by prefix",
+                 firmware::is_text_command_token(token));
+
+    char prefix_line[] = "MOTORS_SYNC_FAULT_STATUS_EXTRA";
+    status = firmware::read_text_command_token(
+        prefix_line, token, sizeof(token));
+    expect_false("prefix token not truncated", status.truncated);
+    expect_false("prefix is not diagnostic command",
+                 firmware::is_text_command_token(token));
 }
 
 void test_servo_validation_and_mapping() {
@@ -384,6 +506,7 @@ void test_sync_fault_status_format() {
 
 int main() {
     test_numeric_parser();
+    test_text_command_parser();
     test_servo_validation_and_mapping();
     test_clock_calculation();
     test_timeout_and_safe_stop();

@@ -5,6 +5,20 @@
 
 namespace firmware {
 
+constexpr std::size_t kTextCommandTokenBufferSize = 64;
+constexpr const char* kMotorsSyncFaultClearAck =
+    "OK MOTORS_SYNC_FAULT_CLEAR";
+
+struct TextCommandToken {
+    char* rest;
+    bool truncated;
+};
+
+TextCommandToken read_text_command_token(char* text,
+                                         char* token,
+                                         std::size_t token_size);
+bool is_text_command_token(const char* command);
+
 constexpr double kSyncKp = 0.30;
 constexpr double kSyncToleranceDeg = 3.0;
 constexpr double kSyncToleranceRatio = 0.20;

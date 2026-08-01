@@ -1,10 +1,12 @@
 #include "firmware_logic.h"
 
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <cstdio>
+#include <cstring>
 
 namespace firmware {
 namespace {
@@ -60,6 +62,79 @@ bool gpio_in_list(int gpio, const int* values, std::size_t count) {
 }
 
 }  // namespace
+
+TextCommandToken read_text_command_token(char* text,
+                                         char* token,
+                                         std::size_t token_size) {
+    TextCommandToken result = {};
+    if (text == nullptr) {
+        if (token != nullptr && token_size > 0) {
+            token[0] = '\0';
+        }
+        result.rest = text;
+        result.truncated = false;
+        return result;
+    }
+
+    while (*text != '\0' &&
+           std::isspace(static_cast<unsigned char>(*text))) {
+        ++text;
+    }
+    std::size_t i = 0;
+    while (*text != '\0' &&
+           !std::isspace(static_cast<unsigned char>(*text))) {
+        if (token != nullptr && token_size > 0 && i + 1 < token_size) {
+            token[i++] = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(*text)));
+        } else {
+            result.truncated = true;
+        }
+        ++text;
+    }
+    if (token != nullptr && token_size > 0) {
+        token[i] = '\0';
+    }
+    result.rest = text;
+    return result;
+}
+
+bool is_text_command_token(const char* command) {
+    if (command == nullptr) {
+        return false;
+    }
+    static const char* const commands[] = {
+        "LED",
+        "PING",
+        "STATUS",
+        "HELP",
+        "PIN_STATUS",
+        "ENCODER",
+        "GPIO_READ",
+        "GPIO_HIGH",
+        "GPIO_LOW",
+        "GPIO_PULSE",
+        "PWM_TEST",
+        "PWM_OFF",
+        "DIAG_ALL_LOW",
+        "MOTORS_SYNC_ROT",
+        "MOTORS_SYNC_STATUS",
+        "MOTORS_SYNC_FAULT_STATUS",
+        "MOTORS_SYNC_FAULT_CLEAR",
+        "MOTORS_SYNC_CANCEL",
+        "STOP",
+        "SAFE",
+        "MOTOR_ENABLE",
+        "MOTOR_DISABLE",
+        "SERVO_ENABLE",
+        "SERVO_DISABLE",
+    };
+    for (const char* known : commands) {
+        if (std::strcmp(command, known) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool parse_numeric_command(const char* text,
                            NumericCommand* command,
