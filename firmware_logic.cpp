@@ -463,6 +463,97 @@ bool deadline_expired(uint64_t now_us,
     return timeout_us > 0 && now_us - start_us >= timeout_us;
 }
 
+const char* sync_fault_type_string(SyncFaultType type) {
+    switch (type) {
+        case SyncFaultType::kNone:
+            return "NONE";
+        case SyncFaultType::kTotalTimeout:
+            return "TOTAL_TIMEOUT";
+        case SyncFaultType::kLeftStall:
+            return "LEFT_STALL";
+        case SyncFaultType::kRightStall:
+            return "RIGHT_STALL";
+    }
+    return "UNKNOWN";
+}
+
+static bool finite_fault_snapshot_values(const SyncFaultSnapshot& snapshot) {
+    return std::isfinite(snapshot.target_deg) &&
+           std::isfinite(snapshot.requested_speed_deg_s) &&
+           std::isfinite(snapshot.left_progress_deg) &&
+           std::isfinite(snapshot.right_progress_deg) &&
+           std::isfinite(snapshot.left_remaining_deg) &&
+           std::isfinite(snapshot.right_remaining_deg) &&
+           std::isfinite(snapshot.left_speed_deg_s) &&
+           std::isfinite(snapshot.right_speed_deg_s) &&
+           std::isfinite(snapshot.correction_deg_s);
+}
+
+bool format_sync_fault_status(char* buffer,
+                              std::size_t buffer_size,
+                              const SyncFaultSnapshot& snapshot) {
+    if (buffer == nullptr || buffer_size == 0) {
+        return false;
+    }
+    if (!snapshot.valid) {
+        int length = std::snprintf(
+            buffer,
+            buffer_size,
+            "SYNC_FAULT state=NONE");
+        return length >= 0 &&
+               static_cast<std::size_t>(length) < buffer_size;
+    }
+    if (!finite_fault_snapshot_values(snapshot)) {
+        return false;
+    }
+    int length = std::snprintf(
+        buffer,
+        buffer_size,
+        "SYNC_FAULT state=VALID type=%s wheel_id=%d "
+        "target_deg=%.3f requested_speed_deg_s=%.3f "
+        "command_start_us=%llu fault_us=%llu elapsed_ms=%llu "
+        "left_raw_count=%d right_raw_count=%d "
+        "left_prev_raw_count=%d right_prev_raw_count=%d "
+        "left_delta_count=%d right_delta_count=%d "
+        "left_progress_deg=%.3f right_progress_deg=%.3f "
+        "left_remaining_deg=%.3f right_remaining_deg=%.3f "
+        "left_speed_deg_s=%.3f right_speed_deg_s=%.3f "
+        "correction_deg_s=%.3f left_reached=%d right_reached=%d "
+        "left_dir_sign=%d right_dir_sign=%d "
+        "left_idle_ms=%llu right_idle_ms=%llu "
+        "left_last_progress_us=%llu right_last_progress_us=%llu",
+        sync_fault_type_string(snapshot.type),
+        snapshot.wheel_id,
+        snapshot.target_deg,
+        snapshot.requested_speed_deg_s,
+        static_cast<unsigned long long>(snapshot.command_start_us),
+        static_cast<unsigned long long>(snapshot.fault_us),
+        static_cast<unsigned long long>(snapshot.elapsed_ms),
+        snapshot.left_raw_count,
+        snapshot.right_raw_count,
+        snapshot.left_prev_raw_count,
+        snapshot.right_prev_raw_count,
+        snapshot.left_delta_count,
+        snapshot.right_delta_count,
+        snapshot.left_progress_deg,
+        snapshot.right_progress_deg,
+        snapshot.left_remaining_deg,
+        snapshot.right_remaining_deg,
+        snapshot.left_speed_deg_s,
+        snapshot.right_speed_deg_s,
+        snapshot.correction_deg_s,
+        snapshot.left_reached ? 1 : 0,
+        snapshot.right_reached ? 1 : 0,
+        snapshot.left_dir_sign,
+        snapshot.right_dir_sign,
+        static_cast<unsigned long long>(snapshot.left_idle_ms),
+        static_cast<unsigned long long>(snapshot.right_idle_ms),
+        static_cast<unsigned long long>(snapshot.left_last_progress_us),
+        static_cast<unsigned long long>(snapshot.right_last_progress_us));
+    return length >= 0 &&
+           static_cast<std::size_t>(length) < buffer_size;
+}
+
 bool is_diagnostic_protected_gpio(int gpio,
                                   int uart_tx_gpio,
                                   int uart_rx_gpio,

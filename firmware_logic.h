@@ -164,6 +164,51 @@ uint64_t calculate_sync_total_timeout_us(double target_abs_deg,
                                          double requested_speed_deg_s);
 bool deadline_expired(uint64_t now_us, uint64_t start_us, uint64_t timeout_us);
 
+enum class SyncFaultType {
+    kNone,
+    kTotalTimeout,
+    kLeftStall,
+    kRightStall,
+};
+
+const char* sync_fault_type_string(SyncFaultType type);
+
+struct SyncFaultSnapshot {
+    bool valid;
+    SyncFaultType type;
+    int wheel_id;
+    double target_deg;
+    double requested_speed_deg_s;
+    uint64_t command_start_us;
+    uint64_t fault_us;
+    uint64_t elapsed_ms;
+    int left_raw_count;
+    int right_raw_count;
+    int left_prev_raw_count;
+    int right_prev_raw_count;
+    int left_delta_count;
+    int right_delta_count;
+    double left_progress_deg;
+    double right_progress_deg;
+    double left_remaining_deg;
+    double right_remaining_deg;
+    double left_speed_deg_s;
+    double right_speed_deg_s;
+    double correction_deg_s;
+    bool left_reached;
+    bool right_reached;
+    int left_dir_sign;
+    int right_dir_sign;
+    uint64_t left_idle_ms;
+    uint64_t right_idle_ms;
+    uint64_t left_last_progress_us;
+    uint64_t right_last_progress_us;
+};
+
+bool format_sync_fault_status(char* buffer,
+                              std::size_t buffer_size,
+                              const SyncFaultSnapshot& snapshot);
+
 bool is_diagnostic_protected_gpio(int gpio,
                                   int uart_tx_gpio,
                                   int uart_rx_gpio,

@@ -41,6 +41,22 @@ void expect_close(const char* name, double actual, double expected,
     }
 }
 
+void expect_contains(const char* name, const char* text, const char* pattern) {
+    if (std::strstr(text, pattern) == nullptr) {
+        std::printf("FAIL %s missing=%s text=%s\n", name, pattern, text);
+        ++failures;
+    }
+}
+
+void expect_not_contains(const char* name,
+                         const char* text,
+                         const char* pattern) {
+    if (std::strstr(text, pattern) != nullptr) {
+        std::printf("FAIL %s unexpected=%s text=%s\n", name, pattern, text);
+        ++failures;
+    }
+}
+
 void stop_motors() {
     ++stop_motor_calls;
 }
@@ -280,6 +296,90 @@ void test_diagnostic_protection() {
                      motor_gpios, 4, encoder_gpios, 4, 25));
 }
 
+firmware::SyncFaultSnapshot sample_sync_fault(
+    firmware::SyncFaultType type) {
+    firmware::SyncFaultSnapshot snapshot = {};
+    snapshot.valid = true;
+    snapshot.type = type;
+    snapshot.wheel_id =
+        type == firmware::SyncFaultType::kLeftStall ? 1 : 0;
+    snapshot.target_deg = 35.569;
+    snapshot.requested_speed_deg_s = 180.0;
+    snapshot.command_start_us = 1000000;
+    snapshot.fault_us = 2500000;
+    snapshot.elapsed_ms = 1500;
+    snapshot.left_raw_count = 123;
+    snapshot.right_raw_count = 456;
+    snapshot.left_prev_raw_count = 122;
+    snapshot.right_prev_raw_count = 456;
+    snapshot.left_delta_count = 3;
+    snapshot.right_delta_count = 0;
+    snapshot.left_progress_deg = 0.277;
+    snapshot.right_progress_deg = 0.0;
+    snapshot.left_remaining_deg = 35.292;
+    snapshot.right_remaining_deg = 35.569;
+    snapshot.left_speed_deg_s = 42.0;
+    snapshot.right_speed_deg_s = 43.0;
+    snapshot.correction_deg_s = 0.083;
+    snapshot.left_reached = false;
+    snapshot.right_reached = false;
+    snapshot.left_dir_sign = -1;
+    snapshot.right_dir_sign = -1;
+    snapshot.left_idle_ms = 10;
+    snapshot.right_idle_ms = 1500;
+    snapshot.left_last_progress_us = 2490000;
+    snapshot.right_last_progress_us = 1000000;
+    return snapshot;
+}
+
+void test_sync_fault_status_format() {
+    char line[1200] = {};
+    firmware::SyncFaultSnapshot none = {};
+    expect_true("none fault formats",
+                firmware::format_sync_fault_status(
+                    line, sizeof(line), none));
+    expect_true("none fault exact",
+                std::strcmp(line, "SYNC_FAULT state=NONE") == 0);
+
+    firmware::SyncFaultSnapshot left =
+        sample_sync_fault(firmware::SyncFaultType::kLeftStall);
+    expect_true("left fault formats",
+                firmware::format_sync_fault_status(
+                    line, sizeof(line), left));
+    expect_contains("left type", line, "type=LEFT_STALL");
+    expect_contains("left wheel id", line, "wheel_id=1");
+    expect_contains("left raw mapping", line, "left_raw_count=123");
+    expect_contains("right raw mapping", line, "right_raw_count=456");
+    expect_contains("left idle", line, "left_idle_ms=10");
+    expect_contains("right idle", line, "right_idle_ms=1500");
+    expect_contains("line prefix", line, "SYNC_FAULT state=VALID");
+    expect_not_contains("no newline", line, "\n");
+    expect_not_contains("no nan", line, "nan");
+    expect_not_contains("no inf", line, "inf");
+
+    firmware::SyncFaultSnapshot right =
+        sample_sync_fault(firmware::SyncFaultType::kRightStall);
+    expect_true("right fault formats",
+                firmware::format_sync_fault_status(
+                    line, sizeof(line), right));
+    expect_contains("right type", line, "type=RIGHT_STALL");
+    expect_contains("right wheel id", line, "wheel_id=0");
+    expect_contains("right is enc0 value", line, "right_raw_count=456");
+
+    firmware::SyncFaultSnapshot cleared = {};
+    expect_true("clear returns none",
+                firmware::format_sync_fault_status(
+                    line, sizeof(line), cleared));
+    expect_true("clear exact",
+                std::strcmp(line, "SYNC_FAULT state=NONE") == 0);
+
+    firmware::SyncFaultSnapshot bad = right;
+    bad.left_progress_deg = std::numeric_limits<double>::infinity();
+    expect_false("non-finite fault rejected",
+                 firmware::format_sync_fault_status(
+                     line, sizeof(line), bad));
+}
+
 }  // namespace
 
 int main() {
@@ -288,6 +388,7 @@ int main() {
     test_clock_calculation();
     test_timeout_and_safe_stop();
     test_diagnostic_protection();
+    test_sync_fault_status_format();
     if (failures != 0) {
         std::printf("firmware_logic_test FAIL count=%d\n", failures);
         return 1;

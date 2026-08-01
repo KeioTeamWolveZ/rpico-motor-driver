@@ -159,6 +159,7 @@ static bool servo_runtime_enabled = false;
 static volatile bool timer_started = false;
 static volatile bool sync_start_initializing = false;
 static volatile SyncRotationState sync_state = {};
+static firmware::SyncFaultSnapshot sync_last_fault = {};
 static repeating_timer_t velocity_timer;
 static repeating_timer_t position_timer;
 static bool diag_high[DIAG_MAX_GPIO + 1] = {false};
@@ -672,6 +673,87 @@ static const char* sync_error_string(SyncError error) {
     return "UNKNOWN";
 }
 
+static firmware::SyncFaultType sync_fault_type_from_error(SyncError error) {
+    switch (error) {
+        case SYNC_ERROR_TOTAL_TIMEOUT:
+            return firmware::SyncFaultType::kTotalTimeout;
+        case SYNC_ERROR_LEFT_STALL:
+            return firmware::SyncFaultType::kLeftStall;
+        case SYNC_ERROR_RIGHT_STALL:
+            return firmware::SyncFaultType::kRightStall;
+        case SYNC_ERROR_NONE:
+            return firmware::SyncFaultType::kNone;
+    }
+    return firmware::SyncFaultType::kNone;
+}
+
+static int sync_fault_wheel_id(SyncError error) {
+    switch (error) {
+        case SYNC_ERROR_LEFT_STALL:
+            return 1;
+        case SYNC_ERROR_RIGHT_STALL:
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+static void clear_sync_fault_detail() {
+    sync_last_fault = {};
+}
+
+static void save_sync_fault_detail(SyncError error,
+                                   uint64_t now_us,
+                                   int left_raw_count,
+                                   int right_raw_count,
+                                   int left_prev_raw_count,
+                                   int right_prev_raw_count,
+                                   int left_delta_count,
+                                   int right_delta_count,
+                                   double left_progress_deg,
+                                   double right_progress_deg,
+                                   double left_remaining_deg,
+                                   double right_remaining_deg,
+                                   double left_speed_deg_s,
+                                   double right_speed_deg_s,
+                                   double correction_deg_s,
+                                   double tolerance_deg) {
+    firmware::SyncFaultSnapshot snapshot = {};
+    snapshot.valid = true;
+    snapshot.type = sync_fault_type_from_error(error);
+    snapshot.wheel_id = sync_fault_wheel_id(error);
+    snapshot.target_deg = sync_state.target_abs_deg;
+    snapshot.requested_speed_deg_s = sync_state.base_speed_deg_s;
+    snapshot.command_start_us = sync_state.operation_start_us;
+    snapshot.fault_us = now_us;
+    snapshot.elapsed_ms =
+        (now_us - sync_state.operation_start_us) / 1000;
+    snapshot.left_raw_count = left_raw_count;
+    snapshot.right_raw_count = right_raw_count;
+    snapshot.left_prev_raw_count = left_prev_raw_count;
+    snapshot.right_prev_raw_count = right_prev_raw_count;
+    snapshot.left_delta_count = left_delta_count;
+    snapshot.right_delta_count = right_delta_count;
+    snapshot.left_progress_deg = left_progress_deg;
+    snapshot.right_progress_deg = right_progress_deg;
+    snapshot.left_remaining_deg = left_remaining_deg;
+    snapshot.right_remaining_deg = right_remaining_deg;
+    snapshot.left_speed_deg_s = left_speed_deg_s;
+    snapshot.right_speed_deg_s = right_speed_deg_s;
+    snapshot.correction_deg_s = correction_deg_s;
+    snapshot.left_reached = left_remaining_deg <= tolerance_deg;
+    snapshot.right_reached = right_remaining_deg <= tolerance_deg;
+    snapshot.left_dir_sign = sync_state.left_dir_sign;
+    snapshot.right_dir_sign = sync_state.right_dir_sign;
+    snapshot.left_idle_ms =
+        (now_us - sync_state.left_last_progress_us) / 1000;
+    snapshot.right_idle_ms =
+        (now_us - sync_state.right_last_progress_us) / 1000;
+    snapshot.left_last_progress_us = sync_state.left_last_progress_us;
+    snapshot.right_last_progress_us = sync_state.right_last_progress_us;
+    sync_last_fault = snapshot;
+}
+
 static void sync_fail(SyncError error) {
     sync_state.active = false;
     sync_state.done = false;
@@ -701,6 +783,8 @@ static void sync_update() {
     uint64_t now_us = time_us_64();
     int left_raw_count = enc[1].get();
     int right_raw_count = enc[0].get();
+    int left_prev_raw_count = sync_state.left_last_raw_count;
+    int right_prev_raw_count = sync_state.right_last_raw_count;
     int left_delta_count = left_raw_count - sync_state.left_start_count;
     int right_delta_count = right_raw_count - sync_state.right_start_count;
     int left_directed_progress_count = -sync_state.left_dir_sign * left_delta_count;
@@ -761,10 +845,28 @@ static void sync_update() {
 
     double left_remaining = sync_state.target_abs_deg - left_progress_deg;
     double right_remaining = sync_state.target_abs_deg - right_progress_deg;
+    double correction_deg_s =
+        firmware::kSyncKp * (left_progress_deg - right_progress_deg);
     if (firmware::deadline_expired(
             now_us,
             sync_state.operation_start_us,
             sync_state.total_timeout_us)) {
+        save_sync_fault_detail(SYNC_ERROR_TOTAL_TIMEOUT,
+                               now_us,
+                               left_raw_count,
+                               right_raw_count,
+                               left_prev_raw_count,
+                               right_prev_raw_count,
+                               left_delta_count,
+                               right_delta_count,
+                               left_progress_deg,
+                               right_progress_deg,
+                               left_remaining,
+                               right_remaining,
+                               sync_state.left_dir_sign * speeds.left_abs,
+                               sync_state.right_dir_sign * speeds.right_abs,
+                               correction_deg_s,
+                               speeds.tolerance);
         sync_fail(SYNC_ERROR_TOTAL_TIMEOUT);
         return;
     }
@@ -773,6 +875,22 @@ static void sync_update() {
             now_us,
             sync_state.left_last_progress_us,
             firmware::kSyncStallTimeoutUs)) {
+        save_sync_fault_detail(SYNC_ERROR_LEFT_STALL,
+                               now_us,
+                               left_raw_count,
+                               right_raw_count,
+                               left_prev_raw_count,
+                               right_prev_raw_count,
+                               left_delta_count,
+                               right_delta_count,
+                               left_progress_deg,
+                               right_progress_deg,
+                               left_remaining,
+                               right_remaining,
+                               sync_state.left_dir_sign * speeds.left_abs,
+                               sync_state.right_dir_sign * speeds.right_abs,
+                               correction_deg_s,
+                               speeds.tolerance);
         sync_fail(SYNC_ERROR_LEFT_STALL);
         return;
     }
@@ -781,6 +899,22 @@ static void sync_update() {
             now_us,
             sync_state.right_last_progress_us,
             firmware::kSyncStallTimeoutUs)) {
+        save_sync_fault_detail(SYNC_ERROR_RIGHT_STALL,
+                               now_us,
+                               left_raw_count,
+                               right_raw_count,
+                               left_prev_raw_count,
+                               right_prev_raw_count,
+                               left_delta_count,
+                               right_delta_count,
+                               left_progress_deg,
+                               right_progress_deg,
+                               left_remaining,
+                               right_remaining,
+                               sync_state.left_dir_sign * speeds.left_abs,
+                               sync_state.right_dir_sign * speeds.right_abs,
+                               correction_deg_s,
+                               speeds.tolerance);
         sync_fail(SYNC_ERROR_RIGHT_STALL);
         return;
     }
@@ -859,6 +993,16 @@ static void print_sync_status() {
         return;
     }
     printf("SYNC_STATUS state=IDLE\n");
+}
+
+static void print_sync_fault_status() {
+    char line[1200];
+    if (!firmware::format_sync_fault_status(
+            line, sizeof(line), sync_last_fault)) {
+        printf("SYNC_FAULT state=FORMAT_ERROR\n");
+        return;
+    }
+    printf("%s\n", line);
 }
 
 static void handle_motors_sync_rot(char* rest) {
@@ -1393,7 +1537,8 @@ static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
            "MOTORS_SYNC_ROT <abs_deg> <left_dir> <right_dir> <speed_deg_s>, "
-           "MOTORS_SYNC_STATUS, MOTORS_SYNC_CANCEL, ENCODER, "
+           "MOTORS_SYNC_STATUS, MOTORS_SYNC_FAULT_STATUS, "
+           "MOTORS_SYNC_FAULT_CLEAR, MOTORS_SYNC_CANCEL, ENCODER, "
            "PIN_STATUS, GPIO_READ <gpio>, GPIO_HIGH <gpio>, GPIO_LOW <gpio>, "
            "GPIO_PULSE <gpio> <ms>, PWM_TEST <gpio> <duty> <ms>, PWM_OFF <gpio>, "
            "DIAG_ALL_LOW, motor commands\n");
@@ -1403,6 +1548,8 @@ static void print_help() {
     printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
     printf("MOTORS_SYNC_ROT: left/right are physical wheels; "
            "left=motor1/enc1 right=motor0/enc0; + is CCW from rover side\n");
+    printf("MOTORS_SYNC_FAULT_STATUS: print last sync fault detail; "
+           "MOTORS_SYNC_FAULT_CLEAR clears it\n");
 }
 
 static bool reject_unexpected_args(const char* command, char* rest) {
@@ -1559,6 +1706,25 @@ static bool handle_text_command(char* line) {
             return true;
         }
         print_sync_status();
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "MOTORS_SYNC_FAULT_STATUS") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
+        print_sync_fault_status();
+        fflush(stdout);
+        return true;
+    }
+
+    if (strcmp(command, "MOTORS_SYNC_FAULT_CLEAR") == 0) {
+        if (reject_unexpected_args(command, rest)) {
+            return true;
+        }
+        clear_sync_fault_detail();
+        printf("OK MOTORS_SYNC_FAULT_CLEAR\n");
         fflush(stdout);
         return true;
     }
