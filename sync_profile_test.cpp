@@ -67,6 +67,10 @@ static void expect_min_speed(double target, double expected_min_speed) {
     expect_close(name, r.min_speed, expected_min_speed);
 }
 
+static double encoder_counts_to_deg(int count) {
+    return static_cast<double>(count) * 360.0 / 3900.0;
+}
+
 int main() {
     expect_close("zero target tolerance",
                  firmware::calculate_sync_tolerance_deg(0.0), 0.0);
@@ -119,6 +123,10 @@ int main() {
     r = calculate_sync_speeds(5.0, 0.0, 0.0, 180.0, true, true, 0, 0, 0);
     expect_true("boost start left active", r.left_boost_active);
     expect_true("boost start right active", r.right_boost_active);
+    expect_false("small target startup assist left inactive",
+                 r.left_startup_assist_active);
+    expect_false("small target startup assist right inactive",
+                 r.right_startup_assist_active);
     expect_close("boost start left", r.left_abs, 80.0);
     expect_close("boost start right", r.right_abs, 80.0);
 
@@ -225,19 +233,169 @@ int main() {
     expect_close("case 5 left", r.left_abs, 30.8031);
     expect_close("case 5 right", r.right_abs, 0.0);
 
-    r = calculate_sync_speeds(30.0, 12.0, 12.0, 180.0);
+    r = calculate_sync_speeds(
+        30.0,
+        12.0,
+        12.0,
+        180.0,
+        false,
+        false,
+        3,
+        3,
+        firmware::kSyncSmallTargetStartBoostMaxUs);
     expect_close("same progress left", r.left_abs, 21.6);
     expect_close("same progress right", r.right_abs, 21.6);
 
     r = calculate_sync_speeds(30.0, 0.0, 0.0, 180.0);
-    expect_close("target 30 initial left", r.left_abs, 36.0);
-    expect_close("target 30 initial right", r.right_abs, 36.0);
+    expect_true("target 30 startup assist eligible",
+                r.startup_assist_eligible);
+    expect_true("target 30 initial left assist active",
+                r.left_startup_assist_active);
+    expect_true("target 30 initial right assist active",
+                r.right_startup_assist_active);
+    expect_close("target 30 initial left", r.left_abs, 50.0);
+    expect_close("target 30 initial right", r.right_abs, 50.0);
 
     r = calculate_sync_speeds(30.0, 0.0, 0.0, 180.0, true, true, 0, 0, 0);
-    expect_false("target 30 left boost inactive", r.left_boost_active);
-    expect_false("target 30 right boost inactive", r.right_boost_active);
-    expect_close("target 30 boost input ignored left", r.left_abs, 36.0);
-    expect_close("target 30 boost input ignored right", r.right_abs, 36.0);
+    expect_false("target 30 left small boost inactive", r.left_boost_active);
+    expect_false("target 30 right small boost inactive", r.right_boost_active);
+    expect_close("target 30 startup assist ignores small boost left",
+                 r.left_abs, 50.0);
+    expect_close("target 30 startup assist ignores small boost right",
+                 r.right_abs, 50.0);
+
+    r = calculate_sync_speeds(30.0, 0.0, 0.0, 180.0, false, false, 0, 0,
+                              firmware::kSyncSmallTargetStartBoostMaxUs);
+    expect_false("target 30 assist releases at window left",
+                 r.left_startup_assist_active);
+    expect_false("target 30 assist releases at window right",
+                 r.right_startup_assist_active);
+    expect_close("target 30 profile after window left", r.left_abs, 36.0);
+    expect_close("target 30 profile after window right", r.right_abs, 36.0);
+
+    const double startup_targets[] = {15.090, 16.168, 21.557, 26.946};
+    for (double startup_target : startup_targets) {
+        r = calculate_sync_speeds(startup_target, 0.0, 0.0, 180.0);
+        char name[96];
+        std::snprintf(name, sizeof(name),
+                      "startup assist target %.3f left", startup_target);
+        expect_close(name, r.left_abs, firmware::kSyncStartupAssistMinSpeedDegS);
+        std::snprintf(name, sizeof(name),
+                      "startup assist target %.3f right", startup_target);
+        expect_close(name, r.right_abs, firmware::kSyncStartupAssistMinSpeedDegS);
+        expect_true("startup assist left active",
+                    r.left_startup_assist_active);
+        expect_true("startup assist right active",
+                    r.right_startup_assist_active);
+    }
+
+    r = calculate_sync_speeds(21.557, 0.0, 0.0, 180.0);
+    expect_close("positive physical command preserves direction",
+                 1.0 * r.left_abs, 50.0);
+    expect_close("negative physical command preserves direction",
+                 -1.0 * r.right_abs, -50.0);
+
+    r = calculate_sync_speeds(
+        21.557,
+        encoder_counts_to_deg(1),
+        encoder_counts_to_deg(1),
+        180.0,
+        false,
+        false,
+        1,
+        1,
+        10000);
+    expect_true("one count keeps left startup assist",
+                r.left_startup_assist_active);
+    expect_true("one count keeps right startup assist",
+                r.right_startup_assist_active);
+    expect_close("one count left speed", r.left_abs, 50.0);
+    expect_close("one count right speed", r.right_abs, 50.0);
+
+    r = calculate_sync_speeds(
+        21.557,
+        encoder_counts_to_deg(3),
+        encoder_counts_to_deg(3),
+        180.0,
+        false,
+        false,
+        3,
+        3,
+        10000);
+    expect_false("three counts releases left startup assist",
+                 r.left_startup_assist_active);
+    expect_false("three counts releases right startup assist",
+                 r.right_startup_assist_active);
+    expect_close("three counts left returns profile",
+                 r.left_abs,
+                 1.2 * (21.557 - encoder_counts_to_deg(3)));
+    expect_close("three counts right returns profile",
+                 r.right_abs,
+                 1.2 * (21.557 - encoder_counts_to_deg(3)));
+
+    r = calculate_sync_speeds(
+        21.557,
+        -encoder_counts_to_deg(3),
+        -encoder_counts_to_deg(3),
+        180.0,
+        false,
+        false,
+        -3,
+        -3,
+        10000);
+    expect_true("reverse counts keep left startup assist",
+                r.left_startup_assist_active);
+    expect_true("reverse counts keep right startup assist",
+                r.right_startup_assist_active);
+    expect_close("reverse counts left speed", r.left_abs, 50.0);
+    expect_close("reverse counts right speed", r.right_abs, 50.0);
+
+    r = calculate_sync_speeds(
+        21.557,
+        0.0,
+        0.0,
+        180.0,
+        false,
+        false,
+        0,
+        0,
+        firmware::kSyncSmallTargetStartBoostMaxUs);
+    expect_false("assist window end left inactive",
+                 r.left_startup_assist_active);
+    expect_false("assist window end right inactive",
+                 r.right_startup_assist_active);
+    expect_close("assist window end left profile", r.left_abs, 25.8684);
+    expect_close("assist window end right profile", r.right_abs, 25.8684);
+
+    r = calculate_sync_speeds(50.0, 0.0, 0.0, 180.0);
+    expect_true("target 50 assist active but does not lower left",
+                r.left_startup_assist_active);
+    expect_true("target 50 assist active but does not lower right",
+                r.right_startup_assist_active);
+    expect_close("target 50 profile remains left", r.left_abs, 60.0);
+    expect_close("target 50 profile remains right", r.right_abs, 60.0);
+
+    r = calculate_sync_speeds(21.557, 18.6, 0.0, 180.0);
+    expect_false("reached left startup assist inactive",
+                 r.left_startup_assist_active);
+    expect_true("unreached right startup assist active",
+                r.right_startup_assist_active);
+    expect_close("reached left remains stopped", r.left_abs, 0.0);
+    expect_close("unreached right gets startup assist", r.right_abs, 50.0);
+
+    r = calculate_sync_speeds(45.0, encoder_counts_to_deg(2), 0.0, 180.0);
+    expect_true("correction case left startup assist active",
+                r.left_startup_assist_active);
+    expect_true("correction case right startup assist active",
+                r.right_startup_assist_active);
+    expect_true("correction changes left speed above assist floor",
+                r.left_abs < 54.0);
+    expect_true("correction changes right speed above assist floor",
+                r.right_abs > 54.0);
+    expect_true("correction keeps left below max",
+                r.left_abs <= firmware::kSyncMaxSpeedDegS);
+    expect_true("correction keeps right below max",
+                r.right_abs <= firmware::kSyncMaxSpeedDegS);
 
     r = calculate_sync_speeds(180.0, 0.0, 0.0, 300.0);
     expect_close("target 180 initial left",
@@ -259,7 +417,16 @@ int main() {
     expect_true("right overshoot left moves", r.left_abs > 0.0);
     expect_close("right overshoot", r.right_abs, 0.0);
 
-    r = calculate_sync_speeds(409.256, -500.0, 0.0, 180.0);
+    r = calculate_sync_speeds(
+        409.256,
+        -500.0,
+        0.0,
+        180.0,
+        false,
+        false,
+        3,
+        3,
+        firmware::kSyncSmallTargetStartBoostMaxUs);
     expect_close("correction clamp left",
                  r.left_abs, firmware::kSyncMaxSpeedDegS);
     expect_close("correction clamp right", r.right_abs, 30.0);
@@ -286,7 +453,16 @@ int main() {
     expect_close("boost beats requested left", r.left_abs, 80.0);
     expect_close("boost beats requested right", r.right_abs, 80.0);
 
-    r = calculate_sync_speeds(30.0, 20.0, 20.0, 10.0);
+    r = calculate_sync_speeds(
+        30.0,
+        20.0,
+        20.0,
+        10.0,
+        false,
+        false,
+        3,
+        3,
+        firmware::kSyncSmallTargetStartBoostMaxUs);
     expect_close("normal target min beats requested left", r.left_abs, 20.0);
     expect_close("normal target min beats requested right", r.right_abs, 20.0);
 
@@ -294,6 +470,15 @@ int main() {
     expect_true("done at effective threshold", r.done);
     expect_close("done left speed", r.left_abs, 0.0);
     expect_close("done right speed", r.right_abs, 0.0);
+
+    expect_close("startup assist min constant",
+                 firmware::kSyncStartupAssistMinSpeedDegS, 50.0);
+    expect_true("startup assist progress counts constant",
+                firmware::kSyncStartupAssistProgressCounts == 3);
+    expect_true("startup assist window uses existing boost window",
+                firmware::kSyncSmallTargetStartBoostMaxUs == 300000);
+    expect_true("stall timeout unchanged",
+                firmware::kSyncStallTimeoutUs == 1500000);
 
     std::printf("sync_profile_test OK\n");
     return 0;

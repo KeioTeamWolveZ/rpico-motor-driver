@@ -28,6 +28,8 @@ constexpr double kSyncSmallTargetMaxDeg = 15.0;
 constexpr double kSyncSmallTargetStartBoostSpeedDegS = 80.0;
 constexpr uint64_t kSyncSmallTargetStartBoostMaxUs = 300000;
 constexpr int kSyncStartBoostProgressCounts = 1;
+constexpr double kSyncStartupAssistMinSpeedDegS = 50.0;
+constexpr int kSyncStartupAssistProgressCounts = 3;
 constexpr double kSyncMaxSpeedDegS = 180.0;
 constexpr double kSyncSlowdownGain = 1.2;
 
@@ -145,11 +147,18 @@ bool sync_start_boost_wheel_active(bool boost_enabled,
                                    double remaining_deg,
                                    double tolerance_deg,
                                    uint64_t elapsed_us);
+bool sync_startup_assist_target_enabled(double target_abs_deg);
+bool sync_startup_assist_wheel_active(bool assist_enabled,
+                                      int directed_progress_count,
+                                      double remaining_deg,
+                                      double tolerance_deg,
+                                      uint64_t elapsed_us);
 double calculate_sync_wheel_base_speed(double remaining_deg,
                                        double requested_speed_deg_s,
                                        double tolerance_deg,
                                        double min_speed_deg_s);
 double apply_sync_start_boost(double base_speed_deg_s, bool boost_active);
+double apply_sync_startup_assist(double speed_abs_deg_s, bool assist_active);
 
 struct SyncSpeedResult {
     double left_abs;
@@ -161,6 +170,9 @@ struct SyncSpeedResult {
     bool boost_eligible;
     bool left_boost_active;
     bool right_boost_active;
+    bool startup_assist_eligible;
+    bool left_startup_assist_active;
+    bool right_startup_assist_active;
 };
 
 SyncSpeedResult calculate_sync_speeds(

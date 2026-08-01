@@ -414,6 +414,30 @@ bool sync_start_boost_wheel_active(bool boost_enabled,
     return true;
 }
 
+bool sync_startup_assist_target_enabled(double target_abs_deg) {
+    return target_abs_deg > kSyncSmallTargetMaxDeg;
+}
+
+bool sync_startup_assist_wheel_active(bool assist_enabled,
+                                      int directed_progress_count,
+                                      double remaining_deg,
+                                      double tolerance_deg,
+                                      uint64_t elapsed_us) {
+    if (!assist_enabled) {
+        return false;
+    }
+    if (remaining_deg <= tolerance_deg) {
+        return false;
+    }
+    if (directed_progress_count >= kSyncStartupAssistProgressCounts) {
+        return false;
+    }
+    if (elapsed_us >= kSyncSmallTargetStartBoostMaxUs) {
+        return false;
+    }
+    return true;
+}
+
 double calculate_sync_wheel_base_speed(double remaining_deg,
                                        double requested_speed_deg_s,
                                        double tolerance_deg,
@@ -440,6 +464,14 @@ double apply_sync_start_boost(double base_speed_deg_s, bool boost_active) {
     return base_speed_deg_s;
 }
 
+double apply_sync_startup_assist(double speed_abs_deg_s, bool assist_active) {
+    if (assist_active &&
+        speed_abs_deg_s < kSyncStartupAssistMinSpeedDegS) {
+        return kSyncStartupAssistMinSpeedDegS;
+    }
+    return speed_abs_deg_s;
+}
+
 SyncSpeedResult calculate_sync_speeds(
     double target,
     double left_progress,
@@ -455,6 +487,8 @@ SyncSpeedResult calculate_sync_speeds(
     result.threshold = calculate_sync_done_threshold_deg(target);
     result.min_speed = calculate_sync_min_speed_deg_s(target);
     result.boost_eligible = sync_start_boost_target_enabled(target);
+    result.startup_assist_eligible =
+        sync_startup_assist_target_enabled(target);
     result.done = left_progress >= result.threshold &&
                   right_progress >= result.threshold;
     if (result.done) {
@@ -475,6 +509,20 @@ SyncSpeedResult calculate_sync_speeds(
         sync_start_boost_wheel_active(
             result.boost_eligible,
             right_boost_input,
+            right_directed_progress_count,
+            right_remaining,
+            result.tolerance,
+            elapsed_us);
+    result.left_startup_assist_active =
+        sync_startup_assist_wheel_active(
+            result.startup_assist_eligible,
+            left_directed_progress_count,
+            left_remaining,
+            result.tolerance,
+            elapsed_us);
+    result.right_startup_assist_active =
+        sync_startup_assist_wheel_active(
+            result.startup_assist_eligible,
             right_directed_progress_count,
             right_remaining,
             result.tolerance,
@@ -500,6 +548,18 @@ SyncSpeedResult calculate_sync_speeds(
         clamp_double(left_base - correction, 0.0, kSyncMaxSpeedDegS);
     result.right_abs =
         clamp_double(right_base + correction, 0.0, kSyncMaxSpeedDegS);
+    result.left_abs =
+        clamp_double(
+            apply_sync_startup_assist(
+                result.left_abs, result.left_startup_assist_active),
+            0.0,
+            kSyncMaxSpeedDegS);
+    result.right_abs =
+        clamp_double(
+            apply_sync_startup_assist(
+                result.right_abs, result.right_startup_assist_active),
+            0.0,
+            kSyncMaxSpeedDegS);
     if (left_remaining <= result.tolerance) {
         result.left_abs = 0.0;
     }
