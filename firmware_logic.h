@@ -5,6 +5,20 @@
 
 namespace firmware {
 
+constexpr std::size_t kTextCommandTokenBufferSize = 64;
+constexpr const char* kMotorsSyncFaultClearAck =
+    "OK MOTORS_SYNC_FAULT_CLEAR";
+
+struct TextCommandToken {
+    char* rest;
+    bool truncated;
+};
+
+TextCommandToken read_text_command_token(char* text,
+                                         char* token,
+                                         std::size_t token_size);
+bool is_text_command_token(const char* command);
+
 constexpr double kSyncKp = 0.30;
 constexpr double kSyncToleranceDeg = 3.0;
 constexpr double kSyncToleranceRatio = 0.20;
@@ -14,6 +28,8 @@ constexpr double kSyncSmallTargetMaxDeg = 15.0;
 constexpr double kSyncSmallTargetStartBoostSpeedDegS = 80.0;
 constexpr uint64_t kSyncSmallTargetStartBoostMaxUs = 300000;
 constexpr int kSyncStartBoostProgressCounts = 1;
+constexpr double kSyncStartupAssistMinSpeedDegS = 50.0;
+constexpr int kSyncStartupAssistProgressCounts = 3;
 constexpr double kSyncMaxSpeedDegS = 180.0;
 constexpr double kSyncSlowdownGain = 1.2;
 
@@ -131,11 +147,18 @@ bool sync_start_boost_wheel_active(bool boost_enabled,
                                    double remaining_deg,
                                    double tolerance_deg,
                                    uint64_t elapsed_us);
+bool sync_startup_assist_target_enabled(double target_abs_deg);
+bool sync_startup_assist_wheel_active(bool assist_enabled,
+                                      int directed_progress_count,
+                                      double remaining_deg,
+                                      double tolerance_deg,
+                                      uint64_t elapsed_us);
 double calculate_sync_wheel_base_speed(double remaining_deg,
                                        double requested_speed_deg_s,
                                        double tolerance_deg,
                                        double min_speed_deg_s);
 double apply_sync_start_boost(double base_speed_deg_s, bool boost_active);
+double apply_sync_startup_assist(double speed_abs_deg_s, bool assist_active);
 
 struct SyncSpeedResult {
     double left_abs;
@@ -147,6 +170,9 @@ struct SyncSpeedResult {
     bool boost_eligible;
     bool left_boost_active;
     bool right_boost_active;
+    bool startup_assist_eligible;
+    bool left_startup_assist_active;
+    bool right_startup_assist_active;
 };
 
 SyncSpeedResult calculate_sync_speeds(
@@ -163,6 +189,51 @@ SyncSpeedResult calculate_sync_speeds(
 uint64_t calculate_sync_total_timeout_us(double target_abs_deg,
                                          double requested_speed_deg_s);
 bool deadline_expired(uint64_t now_us, uint64_t start_us, uint64_t timeout_us);
+
+enum class SyncFaultType {
+    kNone,
+    kTotalTimeout,
+    kLeftStall,
+    kRightStall,
+};
+
+const char* sync_fault_type_string(SyncFaultType type);
+
+struct SyncFaultSnapshot {
+    bool valid;
+    SyncFaultType type;
+    int wheel_id;
+    double target_deg;
+    double requested_speed_deg_s;
+    uint64_t command_start_us;
+    uint64_t fault_us;
+    uint64_t elapsed_ms;
+    int left_raw_count;
+    int right_raw_count;
+    int left_prev_raw_count;
+    int right_prev_raw_count;
+    int left_delta_count;
+    int right_delta_count;
+    double left_progress_deg;
+    double right_progress_deg;
+    double left_remaining_deg;
+    double right_remaining_deg;
+    double left_speed_deg_s;
+    double right_speed_deg_s;
+    double correction_deg_s;
+    bool left_reached;
+    bool right_reached;
+    int left_dir_sign;
+    int right_dir_sign;
+    uint64_t left_idle_ms;
+    uint64_t right_idle_ms;
+    uint64_t left_last_progress_us;
+    uint64_t right_last_progress_us;
+};
+
+bool format_sync_fault_status(char* buffer,
+                              std::size_t buffer_size,
+                              const SyncFaultSnapshot& snapshot);
 
 bool is_diagnostic_protected_gpio(int gpio,
                                   int uart_tx_gpio,

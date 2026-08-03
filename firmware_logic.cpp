@@ -1,10 +1,12 @@
 #include "firmware_logic.h"
 
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <cstdio>
+#include <cstring>
 
 namespace firmware {
 namespace {
@@ -60,6 +62,79 @@ bool gpio_in_list(int gpio, const int* values, std::size_t count) {
 }
 
 }  // namespace
+
+TextCommandToken read_text_command_token(char* text,
+                                         char* token,
+                                         std::size_t token_size) {
+    TextCommandToken result = {};
+    if (text == nullptr) {
+        if (token != nullptr && token_size > 0) {
+            token[0] = '\0';
+        }
+        result.rest = text;
+        result.truncated = false;
+        return result;
+    }
+
+    while (*text != '\0' &&
+           std::isspace(static_cast<unsigned char>(*text))) {
+        ++text;
+    }
+    std::size_t i = 0;
+    while (*text != '\0' &&
+           !std::isspace(static_cast<unsigned char>(*text))) {
+        if (token != nullptr && token_size > 0 && i + 1 < token_size) {
+            token[i++] = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(*text)));
+        } else {
+            result.truncated = true;
+        }
+        ++text;
+    }
+    if (token != nullptr && token_size > 0) {
+        token[i] = '\0';
+    }
+    result.rest = text;
+    return result;
+}
+
+bool is_text_command_token(const char* command) {
+    if (command == nullptr) {
+        return false;
+    }
+    static const char* const commands[] = {
+        "LED",
+        "PING",
+        "STATUS",
+        "HELP",
+        "PIN_STATUS",
+        "ENCODER",
+        "GPIO_READ",
+        "GPIO_HIGH",
+        "GPIO_LOW",
+        "GPIO_PULSE",
+        "PWM_TEST",
+        "PWM_OFF",
+        "DIAG_ALL_LOW",
+        "MOTORS_SYNC_ROT",
+        "MOTORS_SYNC_STATUS",
+        "MOTORS_SYNC_FAULT_STATUS",
+        "MOTORS_SYNC_FAULT_CLEAR",
+        "MOTORS_SYNC_CANCEL",
+        "STOP",
+        "SAFE",
+        "MOTOR_ENABLE",
+        "MOTOR_DISABLE",
+        "SERVO_ENABLE",
+        "SERVO_DISABLE",
+    };
+    for (const char* known : commands) {
+        if (std::strcmp(command, known) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool parse_numeric_command(const char* text,
                            NumericCommand* command,
@@ -339,6 +414,30 @@ bool sync_start_boost_wheel_active(bool boost_enabled,
     return true;
 }
 
+bool sync_startup_assist_target_enabled(double target_abs_deg) {
+    return target_abs_deg > kSyncSmallTargetMaxDeg;
+}
+
+bool sync_startup_assist_wheel_active(bool assist_enabled,
+                                      int directed_progress_count,
+                                      double remaining_deg,
+                                      double tolerance_deg,
+                                      uint64_t elapsed_us) {
+    if (!assist_enabled) {
+        return false;
+    }
+    if (remaining_deg <= tolerance_deg) {
+        return false;
+    }
+    if (directed_progress_count >= kSyncStartupAssistProgressCounts) {
+        return false;
+    }
+    if (elapsed_us >= kSyncSmallTargetStartBoostMaxUs) {
+        return false;
+    }
+    return true;
+}
+
 double calculate_sync_wheel_base_speed(double remaining_deg,
                                        double requested_speed_deg_s,
                                        double tolerance_deg,
@@ -365,6 +464,14 @@ double apply_sync_start_boost(double base_speed_deg_s, bool boost_active) {
     return base_speed_deg_s;
 }
 
+double apply_sync_startup_assist(double speed_abs_deg_s, bool assist_active) {
+    if (assist_active &&
+        speed_abs_deg_s < kSyncStartupAssistMinSpeedDegS) {
+        return kSyncStartupAssistMinSpeedDegS;
+    }
+    return speed_abs_deg_s;
+}
+
 SyncSpeedResult calculate_sync_speeds(
     double target,
     double left_progress,
@@ -380,6 +487,8 @@ SyncSpeedResult calculate_sync_speeds(
     result.threshold = calculate_sync_done_threshold_deg(target);
     result.min_speed = calculate_sync_min_speed_deg_s(target);
     result.boost_eligible = sync_start_boost_target_enabled(target);
+    result.startup_assist_eligible =
+        sync_startup_assist_target_enabled(target);
     result.done = left_progress >= result.threshold &&
                   right_progress >= result.threshold;
     if (result.done) {
@@ -400,6 +509,20 @@ SyncSpeedResult calculate_sync_speeds(
         sync_start_boost_wheel_active(
             result.boost_eligible,
             right_boost_input,
+            right_directed_progress_count,
+            right_remaining,
+            result.tolerance,
+            elapsed_us);
+    result.left_startup_assist_active =
+        sync_startup_assist_wheel_active(
+            result.startup_assist_eligible,
+            left_directed_progress_count,
+            left_remaining,
+            result.tolerance,
+            elapsed_us);
+    result.right_startup_assist_active =
+        sync_startup_assist_wheel_active(
+            result.startup_assist_eligible,
             right_directed_progress_count,
             right_remaining,
             result.tolerance,
@@ -425,6 +548,18 @@ SyncSpeedResult calculate_sync_speeds(
         clamp_double(left_base - correction, 0.0, kSyncMaxSpeedDegS);
     result.right_abs =
         clamp_double(right_base + correction, 0.0, kSyncMaxSpeedDegS);
+    result.left_abs =
+        clamp_double(
+            apply_sync_startup_assist(
+                result.left_abs, result.left_startup_assist_active),
+            0.0,
+            kSyncMaxSpeedDegS);
+    result.right_abs =
+        clamp_double(
+            apply_sync_startup_assist(
+                result.right_abs, result.right_startup_assist_active),
+            0.0,
+            kSyncMaxSpeedDegS);
     if (left_remaining <= result.tolerance) {
         result.left_abs = 0.0;
     }
@@ -461,6 +596,97 @@ bool deadline_expired(uint64_t now_us,
                       uint64_t start_us,
                       uint64_t timeout_us) {
     return timeout_us > 0 && now_us - start_us >= timeout_us;
+}
+
+const char* sync_fault_type_string(SyncFaultType type) {
+    switch (type) {
+        case SyncFaultType::kNone:
+            return "NONE";
+        case SyncFaultType::kTotalTimeout:
+            return "TOTAL_TIMEOUT";
+        case SyncFaultType::kLeftStall:
+            return "LEFT_STALL";
+        case SyncFaultType::kRightStall:
+            return "RIGHT_STALL";
+    }
+    return "UNKNOWN";
+}
+
+static bool finite_fault_snapshot_values(const SyncFaultSnapshot& snapshot) {
+    return std::isfinite(snapshot.target_deg) &&
+           std::isfinite(snapshot.requested_speed_deg_s) &&
+           std::isfinite(snapshot.left_progress_deg) &&
+           std::isfinite(snapshot.right_progress_deg) &&
+           std::isfinite(snapshot.left_remaining_deg) &&
+           std::isfinite(snapshot.right_remaining_deg) &&
+           std::isfinite(snapshot.left_speed_deg_s) &&
+           std::isfinite(snapshot.right_speed_deg_s) &&
+           std::isfinite(snapshot.correction_deg_s);
+}
+
+bool format_sync_fault_status(char* buffer,
+                              std::size_t buffer_size,
+                              const SyncFaultSnapshot& snapshot) {
+    if (buffer == nullptr || buffer_size == 0) {
+        return false;
+    }
+    if (!snapshot.valid) {
+        int length = std::snprintf(
+            buffer,
+            buffer_size,
+            "SYNC_FAULT state=NONE");
+        return length >= 0 &&
+               static_cast<std::size_t>(length) < buffer_size;
+    }
+    if (!finite_fault_snapshot_values(snapshot)) {
+        return false;
+    }
+    int length = std::snprintf(
+        buffer,
+        buffer_size,
+        "SYNC_FAULT state=VALID type=%s wheel_id=%d "
+        "target_deg=%.3f requested_speed_deg_s=%.3f "
+        "command_start_us=%llu fault_us=%llu elapsed_ms=%llu "
+        "left_raw_count=%d right_raw_count=%d "
+        "left_prev_raw_count=%d right_prev_raw_count=%d "
+        "left_delta_count=%d right_delta_count=%d "
+        "left_progress_deg=%.3f right_progress_deg=%.3f "
+        "left_remaining_deg=%.3f right_remaining_deg=%.3f "
+        "left_speed_deg_s=%.3f right_speed_deg_s=%.3f "
+        "correction_deg_s=%.3f left_reached=%d right_reached=%d "
+        "left_dir_sign=%d right_dir_sign=%d "
+        "left_idle_ms=%llu right_idle_ms=%llu "
+        "left_last_progress_us=%llu right_last_progress_us=%llu",
+        sync_fault_type_string(snapshot.type),
+        snapshot.wheel_id,
+        snapshot.target_deg,
+        snapshot.requested_speed_deg_s,
+        static_cast<unsigned long long>(snapshot.command_start_us),
+        static_cast<unsigned long long>(snapshot.fault_us),
+        static_cast<unsigned long long>(snapshot.elapsed_ms),
+        snapshot.left_raw_count,
+        snapshot.right_raw_count,
+        snapshot.left_prev_raw_count,
+        snapshot.right_prev_raw_count,
+        snapshot.left_delta_count,
+        snapshot.right_delta_count,
+        snapshot.left_progress_deg,
+        snapshot.right_progress_deg,
+        snapshot.left_remaining_deg,
+        snapshot.right_remaining_deg,
+        snapshot.left_speed_deg_s,
+        snapshot.right_speed_deg_s,
+        snapshot.correction_deg_s,
+        snapshot.left_reached ? 1 : 0,
+        snapshot.right_reached ? 1 : 0,
+        snapshot.left_dir_sign,
+        snapshot.right_dir_sign,
+        static_cast<unsigned long long>(snapshot.left_idle_ms),
+        static_cast<unsigned long long>(snapshot.right_idle_ms),
+        static_cast<unsigned long long>(snapshot.left_last_progress_us),
+        static_cast<unsigned long long>(snapshot.right_last_progress_us));
+    return length >= 0 &&
+           static_cast<std::size_t>(length) < buffer_size;
 }
 
 bool is_diagnostic_protected_gpio(int gpio,
