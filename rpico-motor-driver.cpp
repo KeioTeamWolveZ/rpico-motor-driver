@@ -126,6 +126,7 @@ struct SyncRotationState {
     bool left_start_boost_active;
     bool right_start_boost_active;
     uint64_t start_boost_start_us;
+    firmware::SyncControlProfile control_profile;
     uint64_t operation_start_us;
     uint64_t total_timeout_us;
     uint64_t left_last_progress_us;
@@ -577,6 +578,29 @@ static bool parse_three_ints(char* text, int* a, int* b, int* c) {
 using firmware::clamp_double;
 using firmware::sync_start_boost_target_enabled;
 
+static void set_sync_state_control_profile(
+        const firmware::SyncControlProfile& profile) {
+    sync_state.control_profile.custom_start_profile =
+        profile.custom_start_profile;
+    sync_state.control_profile.min_speed_deg_s = profile.min_speed_deg_s;
+    sync_state.control_profile.startup_boost_speed_deg_s =
+        profile.startup_boost_speed_deg_s;
+    sync_state.control_profile.startup_boost_max_us =
+        profile.startup_boost_max_us;
+    sync_state.control_profile.startup_boost_release_counts =
+        profile.startup_boost_release_counts;
+}
+
+static firmware::SyncControlProfile sync_state_control_profile() {
+    return {
+        sync_state.control_profile.custom_start_profile,
+        sync_state.control_profile.min_speed_deg_s,
+        sync_state.control_profile.startup_boost_speed_deg_s,
+        sync_state.control_profile.startup_boost_max_us,
+        sync_state.control_profile.startup_boost_release_counts,
+    };
+}
+
 static bool token_equals_ignore_case(const char* a, const char* b) {
     while (*a != 0 && *b != 0) {
         if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) {
@@ -629,6 +653,7 @@ static void sync_cancel(bool stop_motors) {
     sync_state.left_start_boost_active = false;
     sync_state.right_start_boost_active = false;
     sync_state.start_boost_start_us = 0;
+    set_sync_state_control_profile(firmware::default_sync_control_profile());
     sync_state.operation_start_us = 0;
     sync_state.total_timeout_us = 0;
     sync_state.left_last_progress_us = 0;
@@ -808,7 +833,8 @@ static void sync_update() {
             sync_state.right_start_boost_active,
             left_directed_progress_count,
             right_directed_progress_count,
-            elapsed_boost_us);
+            elapsed_boost_us,
+            sync_state_control_profile());
 
     if (speeds.done) {
         motor0->setVel(0);
@@ -992,18 +1018,98 @@ static void print_sync_fault_status() {
     printf("%s\n", line);
 }
 
-static void handle_motors_sync_rot(char* rest) {
+static bool parse_sync_profile_args(char* rest,
+                                    double* abs_deg,
+                                    char* left_dir_token,
+                                    char* right_dir_token,
+                                    double* speed_deg_s,
+                                    double* min_speed_deg_s,
+                                    double* startup_boost_speed_deg_s,
+                                    double* startup_boost_max_ms,
+                                    int* startup_boost_release_counts) {
+    int consumed = 0;
+    return sscanf(rest, "%lf %15s %15s %lf %lf %lf %lf %d %n",
+                  abs_deg,
+                  left_dir_token,
+                  right_dir_token,
+                  speed_deg_s,
+                  min_speed_deg_s,
+                  startup_boost_speed_deg_s,
+                  startup_boost_max_ms,
+                  startup_boost_release_counts,
+                  &consumed) == 8 &&
+           only_spaces(rest + consumed);
+}
+
+static bool validate_sync_profile_command(double speed_deg_s,
+                                          double min_speed_deg_s,
+                                          double startup_boost_speed_deg_s,
+                                          double startup_boost_max_ms,
+                                          int startup_boost_release_counts,
+                                          firmware::SyncControlProfile* profile) {
+    if (!std::isfinite(min_speed_deg_s) ||
+        !std::isfinite(startup_boost_speed_deg_s) ||
+        !std::isfinite(startup_boost_max_ms)) {
+        return false;
+    }
+    if (speed_deg_s > firmware::kSyncMaxSpeedDegS ||
+        min_speed_deg_s <= 0.0 ||
+        min_speed_deg_s > speed_deg_s ||
+        startup_boost_speed_deg_s <= 0.0 ||
+        startup_boost_speed_deg_s > firmware::kSyncMaxSpeedDegS ||
+        startup_boost_max_ms < 0.0 ||
+        startup_boost_max_ms >
+            firmware::kSyncProfileMaxStartBoostUs / 1000.0 ||
+        startup_boost_release_counts < 0 ||
+        startup_boost_release_counts >
+            firmware::kSyncProfileMaxStartBoostProgressCounts) {
+        return false;
+    }
+    uint64_t startup_boost_max_us =
+        static_cast<uint64_t>(std::llround(startup_boost_max_ms * 1000.0));
+    firmware::SyncControlProfile candidate = {
+        true,
+        min_speed_deg_s,
+        startup_boost_speed_deg_s,
+        startup_boost_max_us,
+        startup_boost_release_counts,
+    };
+    if (!firmware::validate_sync_control_profile(candidate)) {
+        return false;
+    }
+    *profile = candidate;
+    return true;
+}
+
+static void handle_motors_sync_rot_with_profile(char* rest, bool explicit_profile) {
     double abs_deg = 0.0;
     double speed_deg_s = 0.0;
+    double min_speed_deg_s = 0.0;
+    double startup_boost_speed_deg_s = 0.0;
+    double startup_boost_max_ms = 0.0;
     char left_dir_token[16];
     char right_dir_token[16];
     int left_dir_sign = 0;
     int right_dir_sign = 0;
+    int startup_boost_release_counts = 0;
+    firmware::SyncControlProfile control_profile =
+        firmware::default_sync_control_profile();
     int consumed = 0;
-    if (sscanf(rest, "%lf %15s %15s %lf %n",
-               &abs_deg, left_dir_token, right_dir_token,
-               &speed_deg_s, &consumed) != 4 ||
-        !only_spaces(rest + consumed) ||
+    bool parsed = explicit_profile
+        ? parse_sync_profile_args(rest,
+                                  &abs_deg,
+                                  left_dir_token,
+                                  right_dir_token,
+                                  &speed_deg_s,
+                                  &min_speed_deg_s,
+                                  &startup_boost_speed_deg_s,
+                                  &startup_boost_max_ms,
+                                  &startup_boost_release_counts)
+        : (sscanf(rest, "%lf %15s %15s %lf %n",
+                  &abs_deg, left_dir_token, right_dir_token,
+                  &speed_deg_s, &consumed) == 4 &&
+           only_spaces(rest + consumed));
+    if (!parsed ||
         !std::isfinite(abs_deg) || !std::isfinite(speed_deg_s)) {
         safe_all();
         printf("ERR INVALID_SYNC_TARGET\n");
@@ -1028,6 +1134,19 @@ static void handle_motors_sync_rot(char* rest) {
     if (speed_deg_s <= 0.0) {
         force_motor_outputs_low();
         printf("ERR INVALID_SYNC_SPEED\n");
+        fflush(stdout);
+        set_led_char('E');
+        return;
+    }
+    if (explicit_profile &&
+        !validate_sync_profile_command(speed_deg_s,
+                                       min_speed_deg_s,
+                                       startup_boost_speed_deg_s,
+                                       startup_boost_max_ms,
+                                       startup_boost_release_counts,
+                                       &control_profile)) {
+        force_motor_outputs_low();
+        printf("ERR INVALID_SYNC_PROFILE\n");
         fflush(stdout);
         set_led_char('E');
         return;
@@ -1079,9 +1198,14 @@ static void handle_motors_sync_rot(char* rest) {
     sync_state.final_right_progress_deg = 0.0;
     sync_state.final_error_deg = 0.0;
     sync_state.start_boost_enabled = sync_start_boost_target_enabled(abs_deg);
+    if (explicit_profile) {
+        sync_state.start_boost_enabled =
+            firmware::sync_start_boost_target_enabled(abs_deg, control_profile);
+    }
     sync_state.left_start_boost_active = sync_state.start_boost_enabled;
     sync_state.right_start_boost_active = sync_state.start_boost_enabled;
     sync_state.start_boost_start_us = 0;
+    set_sync_state_control_profile(control_profile);
     sync_state.error = SYNC_ERROR_NONE;
     sync_state.error_report_pending = false;
 
@@ -1110,13 +1234,36 @@ static void handle_motors_sync_rot(char* rest) {
     sync_start_initializing = false;
     sync_update();
 
-    printf("OK MOTORS_SYNC_ROT target=%.3f left_dir=%c right_dir=%c speed=%.3f\n",
-           sync_state.target_abs_deg,
-           sync_dir_char(sync_state.left_dir_sign),
-           sync_dir_char(sync_state.right_dir_sign),
-           sync_state.base_speed_deg_s);
+    if (explicit_profile) {
+        printf("OK MOTORS_SYNC_ROT_PROFILE target=%.3f left_dir=%c "
+               "right_dir=%c speed=%.3f min_speed=%.3f "
+               "startup_boost_speed=%.3f startup_boost_max_ms=%.3f "
+               "startup_boost_release_counts=%d\n",
+               sync_state.target_abs_deg,
+               sync_dir_char(sync_state.left_dir_sign),
+               sync_dir_char(sync_state.right_dir_sign),
+               sync_state.base_speed_deg_s,
+               sync_state.control_profile.min_speed_deg_s,
+               sync_state.control_profile.startup_boost_speed_deg_s,
+               sync_state.control_profile.startup_boost_max_us / 1000.0,
+               sync_state.control_profile.startup_boost_release_counts);
+    } else {
+        printf("OK MOTORS_SYNC_ROT target=%.3f left_dir=%c right_dir=%c speed=%.3f\n",
+               sync_state.target_abs_deg,
+               sync_dir_char(sync_state.left_dir_sign),
+               sync_dir_char(sync_state.right_dir_sign),
+               sync_state.base_speed_deg_s);
+    }
     fflush(stdout);
     set_led_char('M');
+}
+
+static void handle_motors_sync_rot(char* rest) {
+    handle_motors_sync_rot_with_profile(rest, false);
+}
+
+static void handle_motors_sync_rot_profile(char* rest) {
+    handle_motors_sync_rot_with_profile(rest, true);
 }
 
 static void handle_gpio_read(char* rest) {
@@ -1524,6 +1671,9 @@ static void print_help() {
     printf("COMMANDS: PING, STATUS, STOP, SAFE, MOTOR_ENABLE, MOTOR_DISABLE, "
            "SERVO_ENABLE, SERVO_DISABLE, LED <B|U|O|A|N|M|S|L|R|P|E|I|T|X>, "
            "MOTORS_SYNC_ROT <abs_deg> <left_dir> <right_dir> <speed_deg_s>, "
+           "MOTORS_SYNC_ROT_PROFILE <abs_deg> <left_dir> <right_dir> "
+           "<speed_deg_s> <min_speed_deg_s> <startup_boost_speed_deg_s> "
+           "<startup_boost_max_ms> <startup_boost_release_counts>, "
            "MOTORS_SYNC_STATUS, MOTORS_SYNC_FAULT_STATUS, "
            "MOTORS_SYNC_FAULT_CLEAR, MOTORS_SYNC_CANCEL, ENCODER, "
            "PIN_STATUS, GPIO_READ <gpio>, GPIO_HIGH <gpio>, GPIO_LOW <gpio>, "
@@ -1535,6 +1685,8 @@ static void print_help() {
     printf("ENCODER: print encoder counts as ENCODER left=<count0> right=<count1>\n");
     printf("MOTORS_SYNC_ROT: left/right are physical wheels; "
            "left=motor1/enc1 right=motor0/enc0; + is CCW from rover side\n");
+    printf("MOTORS_SYNC_ROT_PROFILE: one-shot synchronized rotation with "
+           "explicit startup profile; startup_boost_max is milliseconds\n");
     printf("MOTORS_SYNC_FAULT_STATUS: print last sync fault detail; "
            "MOTORS_SYNC_FAULT_CLEAR clears it\n");
 }
@@ -1690,6 +1842,11 @@ static bool handle_text_command(char* line) {
 
     if (strcmp(command, "MOTORS_SYNC_ROT") == 0) {
         handle_motors_sync_rot(rest);
+        return true;
+    }
+
+    if (strcmp(command, "MOTORS_SYNC_ROT_PROFILE") == 0) {
+        handle_motors_sync_rot_profile(rest);
         return true;
     }
 

@@ -187,6 +187,17 @@ void test_text_command_parser() {
     expect_true("sync rot rest preserved",
                 std::strcmp(status.rest, " 21.557 -1 1 180\n") == 0);
 
+    char sync_profile_line[] =
+        "MOTORS_SYNC_ROT_PROFILE 7 - - 180 30 80 300 1\n";
+    status = firmware::read_text_command_token(
+        sync_profile_line, token, sizeof(token));
+    expect_false("sync profile token not truncated", status.truncated);
+    expect_true("sync profile recognized",
+                firmware::is_text_command_token(token));
+    expect_true(
+        "sync profile rest preserved",
+        std::strcmp(status.rest, " 7 - - 180 30 80 300 1\n") == 0);
+
     char safe_line[] = "SAFE";
     status = firmware::read_text_command_token(
         safe_line, token, sizeof(token));
@@ -303,6 +314,34 @@ void test_servo_validation_and_mapping() {
     state = firmware::servo_lifecycle_after_disable();
     expect_true("disable returns output LOW",
                 firmware::servo_lifecycle_output_is_low(state));
+}
+
+void test_sync_control_profile_validation() {
+    firmware::SyncControlProfile profile = {
+        true,
+        30.0,
+        80.0,
+        300000,
+        1,
+    };
+    expect_true("valid sync control profile",
+                firmware::validate_sync_control_profile(profile));
+    profile.min_speed_deg_s = 0.0;
+    expect_false("reject zero profile min speed",
+                 firmware::validate_sync_control_profile(profile));
+    profile.min_speed_deg_s = 30.0;
+    profile.startup_boost_speed_deg_s = firmware::kSyncMaxSpeedDegS + 1.0;
+    expect_false("reject excessive profile boost speed",
+                 firmware::validate_sync_control_profile(profile));
+    profile.startup_boost_speed_deg_s = 80.0;
+    profile.startup_boost_max_us = firmware::kSyncProfileMaxStartBoostUs + 1;
+    expect_false("reject excessive profile boost duration",
+                 firmware::validate_sync_control_profile(profile));
+    profile.startup_boost_max_us = 300000;
+    profile.startup_boost_release_counts =
+        firmware::kSyncProfileMaxStartBoostProgressCounts + 1;
+    expect_false("reject excessive profile release counts",
+                 firmware::validate_sync_control_profile(profile));
 }
 
 void test_clock_calculation() {
@@ -508,6 +547,7 @@ int main() {
     test_numeric_parser();
     test_text_command_parser();
     test_servo_validation_and_mapping();
+    test_sync_control_profile_validation();
     test_clock_calculation();
     test_timeout_and_safe_stop();
     test_diagnostic_protection();

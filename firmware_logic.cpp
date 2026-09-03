@@ -117,6 +117,7 @@ bool is_text_command_token(const char* command) {
         "PWM_OFF",
         "DIAG_ALL_LOW",
         "MOTORS_SYNC_ROT",
+        "MOTORS_SYNC_ROT_PROFILE",
         "MOTORS_SYNC_STATUS",
         "MOTORS_SYNC_FAULT_STATUS",
         "MOTORS_SYNC_FAULT_CLEAR",
@@ -389,8 +390,49 @@ double calculate_sync_min_speed_deg_s(double target_abs_deg) {
     return kSyncMinSpeedDegS;
 }
 
+bool validate_sync_control_profile(const SyncControlProfile& profile) {
+    if (!std::isfinite(profile.min_speed_deg_s) ||
+        !std::isfinite(profile.startup_boost_speed_deg_s)) {
+        return false;
+    }
+    if (profile.min_speed_deg_s <= 0.0 ||
+        profile.startup_boost_speed_deg_s <= 0.0) {
+        return false;
+    }
+    if (profile.min_speed_deg_s > kSyncMaxSpeedDegS ||
+        profile.startup_boost_speed_deg_s > kSyncMaxSpeedDegS) {
+        return false;
+    }
+    if (profile.startup_boost_max_us > kSyncProfileMaxStartBoostUs) {
+        return false;
+    }
+    if (profile.startup_boost_release_counts < 0 ||
+        profile.startup_boost_release_counts >
+            kSyncProfileMaxStartBoostProgressCounts) {
+        return false;
+    }
+    return true;
+}
+
+double calculate_sync_min_speed_deg_s(double target_abs_deg,
+                                      const SyncControlProfile& profile) {
+    if (profile.custom_start_profile) {
+        return profile.min_speed_deg_s;
+    }
+    return calculate_sync_min_speed_deg_s(target_abs_deg);
+}
+
 bool sync_start_boost_target_enabled(double target_abs_deg) {
     return target_abs_deg <= kSyncSmallTargetMaxDeg;
+}
+
+bool sync_start_boost_target_enabled(double target_abs_deg,
+                                     const SyncControlProfile& profile) {
+    if (profile.custom_start_profile) {
+        return profile.startup_boost_max_us > 0 &&
+               profile.startup_boost_release_counts >= 0;
+    }
+    return sync_start_boost_target_enabled(target_abs_deg);
 }
 
 bool sync_start_boost_wheel_active(bool boost_enabled,
@@ -414,8 +456,38 @@ bool sync_start_boost_wheel_active(bool boost_enabled,
     return true;
 }
 
+bool sync_start_boost_wheel_active(bool boost_enabled,
+                                   bool boost_active,
+                                   int directed_progress_count,
+                                   double remaining_deg,
+                                   double tolerance_deg,
+                                   uint64_t elapsed_us,
+                                   const SyncControlProfile& profile) {
+    if (!boost_enabled || !boost_active) {
+        return false;
+    }
+    if (remaining_deg <= tolerance_deg) {
+        return false;
+    }
+    if (directed_progress_count >= profile.startup_boost_release_counts) {
+        return false;
+    }
+    if (elapsed_us >= profile.startup_boost_max_us) {
+        return false;
+    }
+    return true;
+}
+
 bool sync_startup_assist_target_enabled(double target_abs_deg) {
     return target_abs_deg > kSyncSmallTargetMaxDeg;
+}
+
+bool sync_startup_assist_target_enabled(double target_abs_deg,
+                                        const SyncControlProfile& profile) {
+    if (profile.custom_start_profile) {
+        return false;
+    }
+    return sync_startup_assist_target_enabled(target_abs_deg);
 }
 
 bool sync_startup_assist_wheel_active(bool assist_enabled,
@@ -464,6 +536,16 @@ double apply_sync_start_boost(double base_speed_deg_s, bool boost_active) {
     return base_speed_deg_s;
 }
 
+double apply_sync_start_boost(double base_speed_deg_s,
+                              bool boost_active,
+                              const SyncControlProfile& profile) {
+    if (boost_active &&
+        base_speed_deg_s < profile.startup_boost_speed_deg_s) {
+        return profile.startup_boost_speed_deg_s;
+    }
+    return base_speed_deg_s;
+}
+
 double apply_sync_startup_assist(double speed_abs_deg_s, bool assist_active) {
     if (assist_active &&
         speed_abs_deg_s < kSyncStartupAssistMinSpeedDegS) {
@@ -481,14 +563,15 @@ SyncSpeedResult calculate_sync_speeds(
     bool right_boost_input,
     int left_directed_progress_count,
     int right_directed_progress_count,
-    uint64_t elapsed_us) {
+    uint64_t elapsed_us,
+    SyncControlProfile profile) {
     SyncSpeedResult result = {};
     result.tolerance = calculate_sync_tolerance_deg(target);
     result.threshold = calculate_sync_done_threshold_deg(target);
-    result.min_speed = calculate_sync_min_speed_deg_s(target);
-    result.boost_eligible = sync_start_boost_target_enabled(target);
+    result.min_speed = calculate_sync_min_speed_deg_s(target, profile);
+    result.boost_eligible = sync_start_boost_target_enabled(target, profile);
     result.startup_assist_eligible =
-        sync_startup_assist_target_enabled(target);
+        sync_startup_assist_target_enabled(target, profile);
     result.done = left_progress >= result.threshold &&
                   right_progress >= result.threshold;
     if (result.done) {
@@ -498,21 +581,39 @@ SyncSpeedResult calculate_sync_speeds(
     double left_remaining = target - left_progress;
     double right_remaining = target - right_progress;
     result.left_boost_active =
-        sync_start_boost_wheel_active(
-            result.boost_eligible,
-            left_boost_input,
-            left_directed_progress_count,
-            left_remaining,
-            result.tolerance,
-            elapsed_us);
+        profile.custom_start_profile
+            ? sync_start_boost_wheel_active(
+                  result.boost_eligible,
+                  left_boost_input,
+                  left_directed_progress_count,
+                  left_remaining,
+                  result.tolerance,
+                  elapsed_us,
+                  profile)
+            : sync_start_boost_wheel_active(
+                  result.boost_eligible,
+                  left_boost_input,
+                  left_directed_progress_count,
+                  left_remaining,
+                  result.tolerance,
+                  elapsed_us);
     result.right_boost_active =
-        sync_start_boost_wheel_active(
-            result.boost_eligible,
-            right_boost_input,
-            right_directed_progress_count,
-            right_remaining,
-            result.tolerance,
-            elapsed_us);
+        profile.custom_start_profile
+            ? sync_start_boost_wheel_active(
+                  result.boost_eligible,
+                  right_boost_input,
+                  right_directed_progress_count,
+                  right_remaining,
+                  result.tolerance,
+                  elapsed_us,
+                  profile)
+            : sync_start_boost_wheel_active(
+                  result.boost_eligible,
+                  right_boost_input,
+                  right_directed_progress_count,
+                  right_remaining,
+                  result.tolerance,
+                  elapsed_us);
     result.left_startup_assist_active =
         sync_startup_assist_wheel_active(
             result.startup_assist_eligible,
@@ -539,9 +640,15 @@ SyncSpeedResult calculate_sync_speeds(
             right_remaining, requested,
             result.tolerance, result.min_speed);
     left_base =
-        apply_sync_start_boost(left_base, result.left_boost_active);
+        profile.custom_start_profile
+            ? apply_sync_start_boost(
+                  left_base, result.left_boost_active, profile)
+            : apply_sync_start_boost(left_base, result.left_boost_active);
     right_base =
-        apply_sync_start_boost(right_base, result.right_boost_active);
+        profile.custom_start_profile
+            ? apply_sync_start_boost(
+                  right_base, result.right_boost_active, profile)
+            : apply_sync_start_boost(right_base, result.right_boost_active);
     double correction = kSyncKp * (left_progress - right_progress);
 
     result.left_abs =

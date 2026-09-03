@@ -453,6 +453,43 @@ int main() {
     expect_close("boost beats requested left", r.left_abs, 80.0);
     expect_close("boost beats requested right", r.right_abs, 80.0);
 
+    firmware::SyncControlProfile custom_profile = {
+        true,
+        12.0,
+        45.0,
+        120000,
+        2,
+    };
+    r = firmware::calculate_sync_speeds(
+        5.0, 0.0, 0.0, 180.0,
+        false, false, 0, 0, 0, custom_profile);
+    expect_close("custom profile min speed left", r.left_abs, 12.0);
+    expect_close("custom profile min speed right", r.right_abs, 12.0);
+
+    r = firmware::calculate_sync_speeds(
+        5.0, 0.0, 0.0, 180.0,
+        true, true, 0, 0, 0, custom_profile);
+    expect_close("custom profile boost speed left", r.left_abs, 45.0);
+    expect_close("custom profile boost speed right", r.right_abs, 45.0);
+
+    r = firmware::calculate_sync_speeds(
+        5.0, 0.0, 0.0, 180.0,
+        true, true, 1, 1, 10000, custom_profile);
+    expect_true("custom release count keeps boost", r.left_boost_active);
+    expect_close("custom release count left speed", r.left_abs, 45.0);
+
+    r = firmware::calculate_sync_speeds(
+        5.0, 0.0, 0.0, 180.0,
+        true, true, 2, 2, 10000, custom_profile);
+    expect_false("custom release count releases boost", r.left_boost_active);
+    expect_close("custom released left min", r.left_abs, 12.0);
+
+    r = firmware::calculate_sync_speeds(
+        5.0, 0.0, 0.0, 180.0,
+        true, true, 0, 0, 120000, custom_profile);
+    expect_false("custom duration releases boost", r.left_boost_active);
+    expect_close("custom duration left min", r.left_abs, 12.0);
+
     r = calculate_sync_speeds(
         30.0,
         20.0,

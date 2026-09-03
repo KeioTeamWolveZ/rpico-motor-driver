@@ -43,6 +43,8 @@ constexpr uint64_t kSyncMinimumTotalTimeoutUs = 5000000;
 constexpr uint64_t kSyncMaximumTotalTimeoutUs = 60000000;
 constexpr uint64_t kSyncTotalTimeoutMarginUs = 2000000;
 constexpr double kSyncTotalTimeoutMultiplier = 3.0;
+constexpr uint64_t kSyncProfileMaxStartBoostUs = 3000000;
+constexpr int kSyncProfileMaxStartBoostProgressCounts = 1000;
 
 // Continuous-rotation servos interpret this "angle" as a pulse-width command,
 // not as a physical shaft angle. Neutral=90 is provisional until each servo is
@@ -139,15 +141,47 @@ double min_double(double a, double b);
 double max_double(double a, double b);
 double calculate_sync_tolerance_deg(double target_abs_deg);
 double calculate_sync_done_threshold_deg(double target_abs_deg);
+struct SyncControlProfile {
+    bool custom_start_profile;
+    double min_speed_deg_s;
+    double startup_boost_speed_deg_s;
+    uint64_t startup_boost_max_us;
+    int startup_boost_release_counts;
+};
+
+constexpr SyncControlProfile default_sync_control_profile() {
+    return {
+        false,
+        kSyncSmallTargetMinSpeedDegS,
+        kSyncSmallTargetStartBoostSpeedDegS,
+        kSyncSmallTargetStartBoostMaxUs,
+        kSyncStartBoostProgressCounts,
+    };
+}
+
+bool validate_sync_control_profile(const SyncControlProfile& profile);
 double calculate_sync_min_speed_deg_s(double target_abs_deg);
+double calculate_sync_min_speed_deg_s(double target_abs_deg,
+                                      const SyncControlProfile& profile);
 bool sync_start_boost_target_enabled(double target_abs_deg);
+bool sync_start_boost_target_enabled(double target_abs_deg,
+                                     const SyncControlProfile& profile);
 bool sync_start_boost_wheel_active(bool boost_enabled,
                                    bool boost_active,
                                    int directed_progress_count,
                                    double remaining_deg,
                                    double tolerance_deg,
                                    uint64_t elapsed_us);
+bool sync_start_boost_wheel_active(bool boost_enabled,
+                                   bool boost_active,
+                                   int directed_progress_count,
+                                   double remaining_deg,
+                                   double tolerance_deg,
+                                   uint64_t elapsed_us,
+                                   const SyncControlProfile& profile);
 bool sync_startup_assist_target_enabled(double target_abs_deg);
+bool sync_startup_assist_target_enabled(double target_abs_deg,
+                                        const SyncControlProfile& profile);
 bool sync_startup_assist_wheel_active(bool assist_enabled,
                                       int directed_progress_count,
                                       double remaining_deg,
@@ -158,6 +192,9 @@ double calculate_sync_wheel_base_speed(double remaining_deg,
                                        double tolerance_deg,
                                        double min_speed_deg_s);
 double apply_sync_start_boost(double base_speed_deg_s, bool boost_active);
+double apply_sync_start_boost(double base_speed_deg_s,
+                              bool boost_active,
+                              const SyncControlProfile& profile);
 double apply_sync_startup_assist(double speed_abs_deg_s, bool assist_active);
 
 struct SyncSpeedResult {
@@ -184,7 +221,8 @@ SyncSpeedResult calculate_sync_speeds(
     bool right_boost_input = false,
     int left_directed_progress_count = 0,
     int right_directed_progress_count = 0,
-    uint64_t elapsed_us = 0);
+    uint64_t elapsed_us = 0,
+    SyncControlProfile profile = default_sync_control_profile());
 
 uint64_t calculate_sync_total_timeout_us(double target_abs_deg,
                                          double requested_speed_deg_s);
